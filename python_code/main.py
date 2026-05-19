@@ -7,7 +7,7 @@ import math
 import sys
 from collections import deque
 from tkinter import *
-from kart_control import KartController, angle_to_fraction
+from python_code.kart_control import KartController, angle_to_fraction
 
 # ---- kart control integration ----
 
