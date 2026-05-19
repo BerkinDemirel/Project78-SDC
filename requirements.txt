@@ -1,0 +1,19 @@
+# SDC Kart — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# Note: PyTorch + CUDA must be installed separately for your platform.
+# On Jetson Nano Orin, use the Jetson-specific wheels from NVIDIA:
+#   https://developer.nvidia.com/embedded/downloads
+# On Windows/Linux x86:
+#   https://pytorch.org/get-started/locally/
+
+# Computer vision
+opencv-contrib-python
+
+# YOLO inference
+ultralytics
+
+# Arduino serial communication
+pyserial
+
+# JSON is stdlib on Python 3.x — no install needed
