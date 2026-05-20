@@ -1,20 +1,17 @@
 # kart_control.py
 # ─────────────────────────────────────────────
 # Single Arduino, single serial connection.
-# SteeringController and BrakeController share
-# one KartSerial instance under the hood.
 #
-# Usage in main.py (unchanged from before):
-#   from kart_control import SteeringController, BrakeController, angle_to_fraction
+# Usage in sdc.py:
+#   from kart_control import KartController, angle_to_fraction
 #
-#   steer = SteeringController(port="/dev/ttyUSB0")
-#   brake = BrakeController(steer)      # shares the same connection
-#
-#   brake.release()                     # must call before kart can move
-#   steer.steer(angle_to_fraction(steering_angle))
-#   brake.brake(0.5)
-#   steer.estop()   # or brake.estop() — both send {"cmd":"estop"}
-#   steer.close()   # closes shared connection (brake closes too)
+#   kart = KartController(port="/dev/ttyUSB0")
+#   kart.release()                          # must call before kart can move
+#   kart.steer(angle_to_fraction(angle))    # -1.0 … +1.0
+#   kart.brake(0.5)                         # 0.0 released … 1.0 full
+#   kart.estop()                            # full brake + latch
+#   kart.brake_reset()                      # resync open-loop estimate to 0
+#   kart.close()
 # ─────────────────────────────────────────────
 
 import serial
@@ -27,21 +24,33 @@ log = logging.getLogger(__name__)
 
 STEERING_ANGLE_LIMIT = 90.0
 
+# Match STEER_POT_MIN / CTR / MAX in the .ino
+POT_MIN = 452
+POT_CTR = 606
+POT_MAX = 743
+
 
 def angle_to_fraction(angle_deg: float) -> float:
-    """Convert steering angle degrees (-90…+90) to -1.0…+1.0."""
+    """Convert steering angle degrees (-90 … +90) to -1.0 … +1.0."""
     return max(-1.0, min(1.0, angle_deg / STEERING_ANGLE_LIMIT))
+
+
+def pot_to_fraction(raw: int) -> float:
+    """Convert raw pot value to -1.0 … +1.0 using asymmetric centre."""
+    if raw >= POT_CTR:
+        return min(1.0,  (raw - POT_CTR) / (POT_MAX - POT_CTR))
+    else:
+        return max(-1.0, (raw - POT_CTR) / (POT_CTR - POT_MIN))
 
 
 # ──────────────────────────────────────────────
 # SHARED SERIAL CONNECTION
 # ──────────────────────────────────────────────
 
-class KartSerial:
+class _KartSerial:
     """
     Manages the single serial connection to the Arduino.
     Handles connection, reconnection, background telemetry reader.
-    Shared between SteeringController and BrakeController.
     """
 
     def __init__(self, port: str, baud: int = 115200,
@@ -141,40 +150,37 @@ class KartSerial:
 
 
 # ──────────────────────────────────────────────
-# STEERING CONTROLLER
+# KART CONTROLLER
 # ──────────────────────────────────────────────
 
-class SteeringController:
+class KartController:
     """
-    Steering via BTS7960B with potentiometer feedback.
-    Creates the shared KartSerial connection.
+    Single interface for steering + brake on one Arduino.
+
+    Boot behaviour: Arduino boots with full brake applied.
+    You MUST call release() before the kart can move.
 
     Args:
         port: serial port e.g. "/dev/ttyUSB0" or "COM3"
 
     Usage:
-        steer = SteeringController(port="/dev/ttyUSB0")
-        steer.steer(0.35)       # -1.0 … +1.0
-        steer.centre()
-        steer.estop()
-        steer.close()           # also closes shared serial
+        kart = KartController(port="/dev/ttyUSB0")
+        kart.release()                          # release brake before driving
+        kart.steer(angle_to_fraction(angle))    # -1.0 … +1.0
+        kart.brake(0.5)                         # 0.0 released … 1.0 full
+        kart.estop()                            # full brake + latch
+        kart.brake_reset()                      # resync estimate after manual release
+        kart.close()
     """
 
-    # Match these to STEER_POT_MIN / MAX in the .ino
-    POT_MIN = 50
-    POT_MAX = 973
-
     def __init__(self, port: str, baud: int = 115200, auto_reconnect: bool = True):
-        self._serial = KartSerial(port, baud, auto_reconnect=auto_reconnect)
-
-    # expose serial so BrakeController can share it
-    @property
-    def _conn(self):
-        return self._serial
+        self._serial = _KartSerial(port, baud, auto_reconnect=auto_reconnect)
 
     @property
     def connected(self) -> bool:
         return self._serial.connected
+
+    # ── Steering ──────────────────────────────
 
     def steer(self, value: float):
         """Set steering. value: -1.0 (left) … +1.0 (right)."""
@@ -184,103 +190,57 @@ class SteeringController:
     def centre(self):
         self.steer(0.0)
 
-    def estop(self):
-        self._serial.send({"cmd": "estop"})
-
-    def enable(self, on: bool = True):
+    def steer_enable(self, on: bool = True):
         self._serial.send({"cmd": "enable", "axis": "steer", "on": on})
 
     @property
-    def position(self) -> float:
-        """Current steering position as -1.0 … +1.0 (from pot feedback)."""
-        raw  = self._serial.telemetry.get("sp", (self.POT_MIN + self.POT_MAX) // 2)
-        mid  = (self.POT_MIN + self.POT_MAX) / 2.0
-        half = (self.POT_MAX - self.POT_MIN) / 2.0
-        return max(-1.0, min(1.0, (raw - mid) / half))
+    def steer_position(self) -> float:
+        """Current steering position as -1.0 … +1.0 using asymmetric pot."""
+        raw = self._serial.telemetry.get("sp", POT_CTR)
+        return pot_to_fraction(raw)
 
-    @property
-    def telemetry(self) -> dict:
-        return self._serial.telemetry
-
-    def close(self):
-        """Centre steering then close shared serial connection."""
-        self.centre()
-        time.sleep(0.3)
-        self._serial.close()
-
-
-# ──────────────────────────────────────────────
-# BRAKE CONTROLLER
-# ──────────────────────────────────────────────
-
-class BrakeController:
-    """
-    Brake via BTS7960B, open-loop timed (no pot).
-    Shares the serial connection from SteeringController.
-
-    Boot behaviour: Arduino boots with full brake applied.
-    You MUST call release() before the kart can move.
-
-    Args:
-        steering: the SteeringController instance (shares its serial)
-
-    Usage:
-        brake = BrakeController(steer)
-        brake.release()         # release before driving
-        brake.brake(0.5)        # 0.0 released … 1.0 full
-        brake.estop()           # full brake immediately
-        # no need to call brake.close() — steer.close() handles it
-    """
-
-    PING_INTERVAL = 0.3   # seconds between automatic keepalives
-
-    def __init__(self, steering: SteeringController):
-        self._serial    = steering._conn   # shared connection
-        self._stopped   = False
-        self._last_ping = 0.0
-
-        self._pinger = threading.Thread(target=self._ping_loop, daemon=True)
-        self._pinger.start()
-
-    def _ping_loop(self):
-        """Keep the Arduino brake watchdog alive automatically."""
-        while not self._stopped:
-            now = time.time()
-            if now - self._last_ping >= self.PING_INTERVAL:
-                self._serial.send({"cmd": "ping"})
-                self._last_ping = now
-            time.sleep(0.05)
+    # ── Brake ─────────────────────────────────
 
     def brake(self, value: float):
-        """Set brake. value: 0.0 (released) … 1.0 (full brake)."""
+        """Set brake fraction. value: 0.0 (released) … 1.0 (full)."""
         value = max(0.0, min(1.0, float(value)))
         self._serial.send({"cmd": "brake", "value": round(value, 4)})
-        self._last_ping = time.time()
 
     def release(self):
         """Fully release the brake. Call this before driving."""
         self._serial.send({"cmd": "release"})
-        self._last_ping = time.time()
+
+    def brake_reset(self):
+        """
+        Resync the Arduino open-loop brake estimate to 0.
+        Only call when you know the actuator is fully released.
+        """
+        self._serial.send({"cmd": "brake_reset"})
+
+    # ── Shared ────────────────────────────────
 
     def estop(self):
-        """Full brake immediately."""
+        """Full brake immediately + latch. Requires release() to recover."""
         self._serial.send({"cmd": "estop"})
-        self._last_ping = time.time()
 
     @property
-    def fraction(self) -> float:
-        """Last brake fraction reported by Arduino (open-loop estimate)."""
-        return float(self._serial.telemetry.get("bf", 0.0))
+    def telemetry(self) -> dict:
+        """Latest telemetry dict from Arduino: sp, st, bf, bt, es."""
+        return self._serial.telemetry
 
     @property
     def is_estopped(self) -> bool:
         return bool(self._serial.telemetry.get("es", False))
 
     @property
-    def telemetry(self) -> dict:
-        return self._serial.telemetry
+    def brake_fraction(self) -> float:
+        """Current brake fraction (open-loop estimate from Arduino)."""
+        return float(self._serial.telemetry.get("bf", 0.0))
 
-    def stop(self):
-        """Stop pinger thread (called automatically when serial closes)."""
-        self._stopped = True
-        self._pinger.join(timeout=2)
+    def close(self):
+        """Centre steering, apply brake, then close serial."""
+        self.centre()
+        time.sleep(0.3)
+        self.estop()
+        time.sleep(0.5)
+        self._serial.close()
