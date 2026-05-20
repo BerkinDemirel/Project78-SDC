@@ -9,28 +9,32 @@ from collections import deque
 from tkinter import *
 from python_code.kart_control import KartController, angle_to_fraction
 
-# ---- kart control integration ----
+# ── Kart control ──────────────────────────────────────────────────────────────
 
-KART_PORT = "/dev/ttyUSB0"   # Linux (Jetson). Change to "COM3" etc. for Windows.
-KART_ENABLED = True         # set False to run vision-only without hardware
+KART_PORT    = "/dev/ttyUSB0"   # Linux (Jetson). Change to "COM3" etc. for Windows.
+KART_ENABLED = True             # set False to run vision-only without hardware
 
-# --- YOLO model ---
+# ── YOLO model ────────────────────────────────────────────────────────────────
+
 model = YOLO('best.pt')
 
-# --- Steering settings ---
+# ── Steering settings ─────────────────────────────────────────────────────────
+
 STEERING_ANGLE_LIMIT = 90.0
 ROI_TOP              = 0.8
 ROI_BOTTOM           = 0.6
 ROI_LEFT             = 0
 ROI_RIGHT            = 1
 
-# --- Shared state ---
+# ── Shared state ──────────────────────────────────────────────────────────────
+
 prev_left_line  = None
 prev_right_line = None
 error_history   = []
 MAX_HISTORY_LEN = 5
 
-# --- Print throttle ---
+# ── Print throttle ────────────────────────────────────────────────────────────
+
 PRINT_EVERY = 10
 frame_count  = 0
 
@@ -155,7 +159,7 @@ class YoloDetector:
     def __init__(self):
         self.input_frame = None
         self.detections  = []
-        self.boxes_frame = None   # frame with boxes already drawn by YOLO
+        self.boxes_frame = None
         self.input_lock  = threading.Lock()
         self.output_lock = threading.Lock()
         self.stopped     = False
@@ -203,7 +207,7 @@ class YoloDetector:
 
 
 # ──────────────────────────────────────────────
-# LANE DETECTION LOGIC (pure functions, no globals)
+# LANE DETECTION LOGIC
 # ──────────────────────────────────────────────
 
 def smooth_line(current, previous, alpha=0.1):
@@ -228,7 +232,6 @@ def make_line_points(height, line_params):
 
 
 def _detect_lines_worker(frame):
-    """Stateless lane detection — returns (left_line, right_line)."""
     global prev_left_line, prev_right_line
 
     hls        = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
@@ -301,7 +304,8 @@ def _compute_steering(frame_width, left_line, right_line):
         if len(error_history) > MAX_HISTORY_LEN:
             error_history.pop(0)
         smoothed = sum(error_history) / len(error_history)
-        return max(-STEERING_ANGLE_LIMIT, min(STEERING_ANGLE_LIMIT, smoothed * STEERING_ANGLE_LIMIT))
+        return max(-STEERING_ANGLE_LIMIT, min(STEERING_ANGLE_LIMIT,
+                                              smoothed * STEERING_ANGLE_LIMIT))
 
     error      = lane_center - center_x
     max_offset = frame_width * 0.25
@@ -314,7 +318,8 @@ def _compute_steering(frame_width, left_line, right_line):
         error_history.pop(0)
 
     smoothed = sum(error_history) / len(error_history)
-    return max(-STEERING_ANGLE_LIMIT, min(STEERING_ANGLE_LIMIT, smoothed * STEERING_ANGLE_LIMIT))
+    return max(-STEERING_ANGLE_LIMIT, min(STEERING_ANGLE_LIMIT,
+                                          smoothed * STEERING_ANGLE_LIMIT))
 
 
 # ──────────────────────────────────────────────
@@ -356,12 +361,8 @@ def draw_steering_wheel(canvas, angle, width=300, height=300):
 
 def build_display(base_frame, boxes_frame, left_line, right_line,
                   steering_angle, fps_window, prev_time, font):
-    """Merge YOLO boxes + lane lines onto one frame."""
-
-    # Use YOLO-annotated frame as base if available, else raw frame
     display = boxes_frame.copy() if boxes_frame is not None else base_frame.copy()
 
-    # Draw lane lines on top
     line_image = np.zeros_like(display)
     if left_line:
         cv2.line(line_image, left_line[:2],  left_line[2:],  (0, 255, 0), 10)
@@ -369,7 +370,6 @@ def build_display(base_frame, boxes_frame, left_line, right_line,
         cv2.line(line_image, right_line[:2], right_line[2:], (0, 255, 0), 10)
     display = cv2.addWeighted(display, 1.0, line_image, 0.8, 0)
 
-    # Overlays
     direction = "RIGHT" if steering_angle > 0 else "LEFT" if steering_angle < 0 else "STRAIGHT"
     cv2.putText(display, f"Steer: {steering_angle:.1f}deg ({direction})",
                 (10, 40), font, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
@@ -384,6 +384,21 @@ def build_display(base_frame, boxes_frame, left_line, right_line,
 
 
 # ──────────────────────────────────────────────
+# KART HELPER
+# ──────────────────────────────────────────────
+
+def make_kart():
+    """Connect to kart hardware. Returns KartController or None."""
+    if not KART_ENABLED:
+        return None
+    kart = KartController(port=KART_PORT)
+    if not kart.connected:
+        print("WARNING: Arduino not connected — running without hardware output.")
+        return None
+    return kart
+
+
+# ──────────────────────────────────────────────
 # CAMERA MODE
 # ──────────────────────────────────────────────
 
@@ -392,11 +407,10 @@ def run_on_camera(source=1):
     frame_count = 0
     error_history.clear()
 
-    kart = KartController(port=KART_PORT) if KART_ENABLED else None
-    if kart and not kart.connected:
-        print("WARNING: Arduino not connected — running without hardware output.")
-        kart = None
-    
+    kart = make_kart()
+    if kart:
+        kart.release()
+
     capture  = FrameCapture(source=source, max_retries=5)
     lane_det = LaneDetector()
     yolo_det = YoloDetector()
@@ -414,7 +428,7 @@ def run_on_camera(source=1):
 
     cv2.namedWindow("SDC View", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("SDC View", 1280, 720)
-    print("Camera mode — press 'q' to quit.")
+    print("Camera mode — press 'q' to quit, 'e' for e-stop.")
 
     while True:
         frame = capture.read()
@@ -425,16 +439,14 @@ def run_on_camera(source=1):
             print("Camera stopped.")
             break
 
-        # Submit to worker threads (non-blocking)
         lane_det.submit(frame)
         yolo_det.submit(frame)
 
-        # Read latest results from each thread
         left_line, right_line, steering_angle = lane_det.read()
-        if kart:
-            fraction = angle_to_fraction(steering_angle)
-            kart.steer(fraction)
         boxes_frame, detections               = yolo_det.read()
+
+        if kart:
+            kart.steer(angle_to_fraction(steering_angle))
 
         display, direction, prev_time = build_display(
             frame, boxes_frame, left_line, right_line,
@@ -450,7 +462,8 @@ def run_on_camera(source=1):
             if detections:
                 for d in detections:
                     x1, y1, x2, y2 = d['bbox']
-                    print(f"  {d['label']:20s}  conf: {d['confidence']:.2f}  box: ({x1},{y1})->({x2},{y2})")
+                    print(f"  {d['label']:20s}  conf: {d['confidence']:.2f}  "
+                          f"box: ({x1},{y1})->({x2},{y2})")
             else:
                 print("  No objects detected")
 
@@ -458,16 +471,14 @@ def run_on_camera(source=1):
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
-        elif key == ord('e'):          # press E for emergency stop
+        elif key == ord('e'):
             if kart:
                 kart.estop()
                 print("ESTOP triggered!")
 
-
     lane_det.release()
     yolo_det.release()
     if kart:
-        kart.estop()
         kart.close()
     capture.release()
     cv2.destroyAllWindows()
@@ -483,10 +494,9 @@ def run_on_video(path):
     frame_count = 0
     error_history.clear()
 
-    kart = KartController(port=KART_PORT) if KART_ENABLED else None
-    if kart and not kart.connected:
-        print("WARNING: Arduino not connected — running without hardware output.")
-        kart = None
+    kart = make_kart()
+    if kart:
+        kart.release()
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -514,7 +524,7 @@ def run_on_video(path):
 
     cv2.namedWindow("SDC View", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("SDC View", 1280, 720)
-    print("Video mode — press 'q' to quit, 'p' to pause/resume.")
+    print("Video mode — press 'q' to quit, 'p' to pause/resume, 'e' for e-stop.")
 
     paused = False
 
@@ -529,18 +539,15 @@ def run_on_video(path):
             yolo_det.submit(frame)
 
             left_line, right_line, steering_angle = lane_det.read()
+            boxes_frame, detections               = yolo_det.read()
 
             if kart:
-                fraction = angle_to_fraction(steering_angle)
-                kart.steer(fraction)
-
-            boxes_frame, detections               = yolo_det.read()
+                kart.steer(angle_to_fraction(steering_angle))
 
             display, direction, prev_time = build_display(
                 frame, boxes_frame, left_line, right_line,
                 steering_angle, fps_window, prev_time, font)
 
-            # Progress bar
             progress = frame_count / max(total, 1)
             bar_w    = int(display.shape[1] * progress)
             cv2.rectangle(display, (0, display.shape[0] - 6),
@@ -551,12 +558,15 @@ def run_on_video(path):
 
             frame_count += 1
             if frame_count % PRINT_EVERY == 0:
-                print(f"\n--- Frame {frame_count}/{total} | Steer {direction:6s} {abs(steering_angle):.1f}° | "
-                      f"left={'yes' if left_line else 'no':3s} right={'yes' if right_line else 'no'} ---")
+                print(f"\n--- Frame {frame_count}/{total} | Steer {direction:6s} "
+                      f"{abs(steering_angle):.1f}° | "
+                      f"left={'yes' if left_line else 'no':3s} "
+                      f"right={'yes' if right_line else 'no'} ---")
                 if detections:
                     for d in detections:
                         x1, y1, x2, y2 = d['bbox']
-                        print(f"  {d['label']:20s}  conf: {d['confidence']:.2f}  box: ({x1},{y1})->({x2},{y2})")
+                        print(f"  {d['label']:20s}  conf: {d['confidence']:.2f}  "
+                              f"box: ({x1},{y1})->({x2},{y2})")
                 else:
                     print("  No objects detected")
 
@@ -568,11 +578,10 @@ def run_on_video(path):
         elif key == ord('p'):
             paused = not paused
             print("Paused." if paused else "Resumed.")
-        elif key == ord('e'):          # press E for emergency stop
+        elif key == ord('e'):
             if kart:
                 kart.estop()
                 print("ESTOP triggered!")
-
 
         if paused:
             master.update()
@@ -580,7 +589,6 @@ def run_on_video(path):
     lane_det.release()
     yolo_det.release()
     if kart:
-        kart.estop()
         kart.close()
     cap.release()
     cv2.destroyAllWindows()

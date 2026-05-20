@@ -1,0 +1,19 @@
+#define STOP_BTN 2
+#define RESUME_BTN 3
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(STOP_BTN, INPUT_PULLUP);
+  pinMode(RESUME_BTN, INPUT_PULLUP);
+}
+
+void loop() {
+  if (digitalRead(STOP_BTN) == LOW) {
+    Serial.println("stop");
+    delay(500);
+  }
+  if (digitalRead(RESUME_BTN) == LOW) {
+    Serial.println("resume");
+    delay(500);
+  }
+}
