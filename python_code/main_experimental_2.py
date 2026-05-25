@@ -32,7 +32,7 @@ KART_ENABLED = True
 
 # ── YOLO ──────────────────────────────────────────────────────────────────────
 
-model = YOLO('object_models/best.pt')
+model = None
 
 YOLO_ENABLED = False   # toggle with 'o' key at runtime
 
@@ -49,10 +49,10 @@ STEERING_ANGLE_LIMIT = 90.0
 #
 # Tweak ROI_TOP_LEFT / ROI_TOP_RIGHT first if one lane is still missed.
 
-ROI_TOP_Y     = 0.3
+ROI_TOP_Y     = 0.35
 ROI_BOTTOM_Y  = 0.95
-ROI_TOP_LEFT  = 0.20   # wider top catches left line earlier
-ROI_TOP_RIGHT = 0.80
+ROI_TOP_LEFT  = 0.10   # wider top catches left line earlier
+ROI_TOP_RIGHT = 0.90
 ROI_BOT_LEFT  = 0   # small inset keeps the opposite-lane line out
 ROI_BOT_RIGHT = 1
 
@@ -340,6 +340,19 @@ def _edge_image(frame):
     edges   = cv2.Canny(blur, 50, 150)
 
     return cv2.bitwise_and(edges, color_mask)
+
+
+def _lane_mask(frame):
+    """Return the raw white+yellow color mask — shows the full lane fill with no edge postprocessing."""
+    hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
+    white  = cv2.inRange(hls, np.array([0,   130,   0]),
+                              np.array([255, 255,  60]))
+    yellow = cv2.inRange(hls, np.array([15,   80,  80]),
+                              np.array([35,  255, 255]))
+    dot_kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    white_clean = cv2.morphologyEx(white, cv2.MORPH_OPEN, dot_kernel, iterations=1)
+    white_clean = _remove_small_blobs(white_clean, DOT_MIN_AREA)
+    return cv2.bitwise_or(white_clean, yellow)
 
 
 def _fit_poly(pts_x, pts_y, h):
@@ -827,6 +840,8 @@ def run_on_camera(source=1):
 
     cv2.namedWindow("SDC View [EXP]", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("SDC View [EXP]", 1280, 720)
+    cv2.namedWindow("Lane Mask", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Lane Mask", 640, 360)
     print("Camera mode — press 'q' quit | 'e' e-stop | 'o' toggle YOLO")
 
     while True:
@@ -863,6 +878,7 @@ def run_on_camera(source=1):
                   f"YOLO={'ON ' if YOLO_ENABLED else 'OFF'} | Traffic: {status_text} ---")
 
         cv2.imshow("SDC View [EXP]", display)
+        cv2.imshow("Lane Mask", _lane_mask(frame))
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -918,6 +934,8 @@ def run_on_video(path):
 
     cv2.namedWindow("SDC View [EXP]", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("SDC View [EXP]", 1280, 720)
+    cv2.namedWindow("Lane Mask", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Lane Mask", 640, 360)
     print("Video mode — press 'q' quit | 'p' pause | 'e' e-stop | 'o' toggle YOLO")
 
     paused = False
@@ -963,6 +981,7 @@ def run_on_video(path):
                       f"YOLO={'ON ' if YOLO_ENABLED else 'OFF'} | Traffic: {status_text} ---")
 
             cv2.imshow("SDC View [EXP]", display)
+            cv2.imshow("Lane Mask", _lane_mask(frame))
 
         key = cv2.waitKey(delay) & 0xFF
         if key == ord('q'):
