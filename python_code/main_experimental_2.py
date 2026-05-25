@@ -49,12 +49,15 @@ STEERING_ANGLE_LIMIT = 90.0
 #
 # Tweak ROI_TOP_LEFT / ROI_TOP_RIGHT first if one lane is still missed.
 
-ROI_TOP_Y     = 0.35
+ROI_TOP_Y     = 0.5
 ROI_BOTTOM_Y  = 0.95
-ROI_TOP_LEFT  = 0.10   # wider top catches left line earlier
+ROI_TOP_LEFT  = 0.10
 ROI_TOP_RIGHT = 0.90
-ROI_BOT_LEFT  = 0   # small inset keeps the opposite-lane line out
-ROI_BOT_RIGHT = 1
+ROI_BOT_LEFT  = 0.0
+ROI_BOT_RIGHT = 1.0
+
+# How far the top edge shifts per degree of steering (fraction of width)
+ROI_STEER_SHIFT = 0.002
 
 # ── Lane detection tuning ─────────────────────────────────────────────────────
 
@@ -62,13 +65,13 @@ POLY_DEGREE            = 2
 ALPHA_FRESH            = 0.35
 ALPHA_MEDIUM           = 0.15
 ALPHA_STALE            = 0.04
-MIN_VERTICAL_SPAN_FRAC = 0.15   # lowered: accept shorter left-line segments
+MIN_VERTICAL_SPAN_FRAC = 0.08   # shorter ROI → lines span less vertically
 ASSUMED_LANE_WIDTH_FRAC= 0.6
 MAX_HISTORY            = 7
 N_POLY_POINTS          = 20
-HOUGH_THRESHOLD        = 30
-HOUGH_MIN_LEN          = 60    # raised back: dots are killed before Hough now
-HOUGH_MAX_GAP          = 120
+HOUGH_THRESHOLD        = 20    # lower: fewer edge pixels in a smaller ROI
+HOUGH_MIN_LEN          = 30    # shorter: lines are shorter in a smaller ROI
+HOUGH_MAX_GAP          = 80
 HOUGH_MIN_SLOPE        = 0.40
 
 # ── Dot / road-stud filter ────────────────────────────────────────────────────
@@ -267,16 +270,25 @@ class FrameCapture:
 # LANE DETECTION — helpers
 # ──────────────────────────────────────────────
 
-def _roi_mask(shape):
-    """Trapezoid ROI — narrow at the top (horizon), wide at the bottom (near)."""
+def _roi_points(shape, steering_angle: float = 0.0):
+    """Return the four trapezoid corners, shifted laterally by steering angle."""
+    h, w = shape
+    shift = float(np.clip(steering_angle * ROI_STEER_SHIFT, -0.15, 0.15))
+    tl = float(np.clip(ROI_TOP_LEFT  + shift, 0.0, 0.49))
+    tr = float(np.clip(ROI_TOP_RIGHT + shift, 0.51, 1.0))
+    return np.array([[
+        (int(w * ROI_BOT_LEFT),  int(h * ROI_BOTTOM_Y)),
+        (int(w * tl),            int(h * ROI_TOP_Y)),
+        (int(w * tr),            int(h * ROI_TOP_Y)),
+        (int(w * ROI_BOT_RIGHT), int(h * ROI_BOTTOM_Y)),
+    ]], dtype=np.int32), tl, tr
+
+
+def _roi_mask(shape, steering_angle: float = 0.0):
+    """Trapezoid ROI mask, adaptive to current steering angle."""
     h, w = shape
     mask = np.zeros((h, w), dtype=np.uint8)
-    pts  = np.array([[
-        (int(w * ROI_BOT_LEFT),  int(h * ROI_BOTTOM_Y)),
-        (int(w * ROI_TOP_LEFT),  int(h * ROI_TOP_Y)),
-        (int(w * ROI_TOP_RIGHT), int(h * ROI_TOP_Y)),
-        (int(w * ROI_BOT_RIGHT), int(h * ROI_BOTTOM_Y)),
-    ]], dtype=np.int32)
+    pts, _, _ = _roi_points(shape, steering_angle)
     cv2.fillPoly(mask, pts, 255)
     return mask
 
@@ -392,10 +404,14 @@ def _smooth_poly(current, previous, conf):
 def _detect_lines_worker(frame, state: LaneState):
     h, w    = frame.shape[:2]
     y_top   = int(h * ROI_TOP_Y)
-    y_bot   = int(h * ROI_BOTTOM_Y)
-    edges   = _edge_image(frame)
-    mask    = _roi_mask((h, w))
-    cropped = cv2.bitwise_and(edges, mask)
+    y_bot     = int(h * ROI_BOTTOM_Y)
+    cur_angle = (state.error_hist[-1] * STEERING_ANGLE_LIMIT
+                 if state.error_hist else 0.0)
+    roi       = _roi_mask((h, w), steering_angle=cur_angle)
+    # Black out everything outside the ROI before any processing
+    roi_frame = cv2.bitwise_and(frame, frame, mask=roi)
+    edges     = _edge_image(roi_frame)
+    cropped   = edges  # already ROI-limited
 
     lines = cv2.HoughLinesP(cropped, 1, np.pi / 180,
                             threshold=HOUGH_THRESHOLD,
@@ -437,16 +453,8 @@ def _detect_lines_worker(frame, state: LaneState):
     state.left_real  = new_left  is not None
     state.right_real = new_right is not None
 
-    left_pts  = _sample_poly(state.left_poly,  y_top, y_bot) if state.left_poly  is not None else None
-    right_pts = _sample_poly(state.right_poly, y_top, y_bot) if state.right_poly is not None else None
-
-    # Missing lane: draw a parallel copy of the detected line shifted by lane width.
-    # Purely visual — state.left_real / state.right_real stay False so steering ignores it.
-    lane_w = int(ASSUMED_LANE_WIDTH_FRAC * w)
-    if left_pts is not None and right_pts is None:
-        right_pts = [(x + lane_w, y) for x, y in left_pts]
-    elif right_pts is not None and left_pts is None:
-        left_pts  = [(x - lane_w, y) for x, y in right_pts]
+    left_pts  = _sample_poly(state.left_poly,  y_top, y_bot) if state.left_real  else None
+    right_pts = _sample_poly(state.right_poly, y_top, y_bot) if state.right_real else None
 
     return left_pts, right_pts, state
 
@@ -457,21 +465,11 @@ def _compute_steering(frame_width, left_pts, right_pts, state: LaneState):
     lx = left_pts[0][0]  if left_pts  else None
     rx = right_pts[0][0] if right_pts else None
 
-    if lx is not None and rx is not None:
-        lane_center = (lx + rx) // 2
-    elif lx is not None:
-        lane_center = lx + int(ASSUMED_LANE_WIDTH_FRAC * frame_width / 2)
-    elif rx is not None:
-        lane_center = rx - int(ASSUMED_LANE_WIDTH_FRAC * frame_width / 2)
-    else:
-        # Complete loss — hold last error and decay
-        last = state.error_hist[-1] if state.error_hist else 0.0
-        state.error_hist.append(last)
-        if len(state.error_hist) > MAX_HISTORY:
-            state.error_hist.pop(0)
-        smoothed = np.mean(state.error_hist)
-        return float(np.clip(smoothed * STEERING_ANGLE_LIMIT,
-                             -STEERING_ANGLE_LIMIT, STEERING_ANGLE_LIMIT))
+    if lx is None or rx is None:
+        state.error_hist.clear()
+        return 0.0
+
+    lane_center = (lx + rx) // 2
 
     error      = lane_center - cx
     normalized = float(np.clip(error / (frame_width * 0.30), -1.0, 1.0))
@@ -660,15 +658,11 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
 
     out = cv2.addWeighted(out, 1.0, overlay, 0.55, 0)
 
-    # ── ROI trapezoid outline (dashed cyan) ──────────────────────────────────
-    roi_pts = np.array([
-        (int(w * ROI_BOT_LEFT),  int(h * ROI_BOTTOM_Y)),
-        (int(w * ROI_TOP_LEFT),  int(h * ROI_TOP_Y)),
-        (int(w * ROI_TOP_RIGHT), int(h * ROI_TOP_Y)),
-        (int(w * ROI_BOT_RIGHT), int(h * ROI_BOTTOM_Y)),
-    ], dtype=np.int32)
-    roi_color  = (255, 220, 0)
-    dash, gap  = 14, 8
+    # ── Adaptive ROI trapezoid outline (dashed yellow) ────────────────────────
+    roi_arr, tl, tr = _roi_points((h, w), steering_angle)
+    roi_pts   = roi_arr[0]
+    roi_color = (255, 220, 0)
+    dash, gap = 14, 8
     for p1, p2 in zip(roi_pts, np.roll(roi_pts, -1, axis=0)):
         x1, y1 = int(p1[0]), int(p1[1])
         x2, y2 = int(p2[0]), int(p2[1])
@@ -683,8 +677,7 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
     for pt in roi_pts:
         cv2.circle(out, tuple(pt), 4, roi_color, -1, cv2.LINE_AA)
     cv2.putText(out, "ROI",
-                (int(w * (ROI_TOP_LEFT + ROI_TOP_RIGHT) / 2) - 16,
-                 int(h * ROI_TOP_Y) - 8),
+                (int(w * (tl + tr) / 2) - 16, int(h * ROI_TOP_Y) - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, roi_color, 1, cv2.LINE_AA)
 
     # ── Steering decision line ────────────────────────────────────────────────
@@ -878,7 +871,8 @@ def run_on_camera(source=1):
                   f"YOLO={'ON ' if YOLO_ENABLED else 'OFF'} | Traffic: {status_text} ---")
 
         cv2.imshow("SDC View [EXP]", display)
-        cv2.imshow("Lane Mask", _lane_mask(frame))
+        _roi = _roi_mask(frame.shape[:2], steering_angle=steering_angle)
+        cv2.imshow("Lane Mask", _lane_mask(cv2.bitwise_and(frame, frame, mask=_roi)))
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
@@ -981,7 +975,8 @@ def run_on_video(path):
                       f"YOLO={'ON ' if YOLO_ENABLED else 'OFF'} | Traffic: {status_text} ---")
 
             cv2.imshow("SDC View [EXP]", display)
-            cv2.imshow("Lane Mask", _lane_mask(frame))
+            _roi = _roi_mask(frame.shape[:2], steering_angle=steering_angle)
+        cv2.imshow("Lane Mask", _lane_mask(cv2.bitwise_and(frame, frame, mask=_roi)))
 
         key = cv2.waitKey(delay) & 0xFF
         if key == ord('q'):
