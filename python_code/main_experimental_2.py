@@ -31,10 +31,10 @@ KART_PORT    = "/dev/ttyUSB0"
 KART_ENABLED = True
 
 # ── YOLO ──────────────────────────────────────────────────────────────────────
-
-model = YOLO('object_models/best.pt')
-
 YOLO_ENABLED = False   # toggle with 'o' key at runtime
+
+model = YOLO('object_models/best.pt') if YOLO_ENABLED else None
+
 
 # ── Steering settings ─────────────────────────────────────────────────────────
 
