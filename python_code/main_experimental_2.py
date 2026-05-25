@@ -32,7 +32,7 @@ KART_ENABLED = True
 
 # ── YOLO ──────────────────────────────────────────────────────────────────────
 
-model = None
+model = YOLO('object_models/best.pt')
 
 YOLO_ENABLED = False   # toggle with 'o' key at runtime
 
