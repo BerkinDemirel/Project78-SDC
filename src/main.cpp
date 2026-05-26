@@ -153,7 +153,7 @@ void calibrateSteer() {
   delay(1000);
   STEER_POT_MAX = steer.currentPos;
   STEER_POT_CTR = (STEER_POT_MIN + STEER_POT_MAX) / 2;
-  steer.targetPos = steer.currentPos = STEER_POT_CTR;
+  steer.targetPos = STEER_POT_CTR;
   updateSteering();
 }
 
