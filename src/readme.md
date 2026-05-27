@@ -1,6 +1,6 @@
 # Kart Controller — Arduino & Web-testpanel
 
-Handleiding voor de Arduino-firmware (`src/main.cpp`) en het bijbehorende web-testpanel (`debug_webui/steering_test_panel.html`).
+Handleiding voor de Arduino-firmware (`src/main.cpp`) en het bijbehorende web-testpanel (`debug_webui/index.html`).
 
 ---
 
