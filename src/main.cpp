@@ -31,9 +31,9 @@
 // ═════════════════════════════════════════════
 
 // Steering
-#define STEER_POT_MIN     452
-#define STEER_POT_CTR     606
-#define STEER_POT_MAX     743
+int STEER_POT_MIN     = 452;
+int STEER_POT_CTR     = 606;
+int STEER_POT_MAX     = 743;
 #define STEER_DEADBAND    8
 #define STEER_PWM_MIN     60
 #define STEER_PWM_MAX     200
@@ -142,6 +142,21 @@ void releaseBrake() {
   brk.current = brk.target = 0.0f;
 }
 
+void calibrateSteer() {
+  // Run steering to both extremes to find min/max if needed
+  steer.targetPos = 0;
+  updateSteering();
+  delay(1000);
+  STEER_POT_MIN = steer.currentPos;
+  steer.targetPos = 1024;
+  updateSteering();
+  delay(1000);
+  STEER_POT_MAX = steer.currentPos;
+  STEER_POT_CTR = (STEER_POT_MIN + STEER_POT_MAX) / 2;
+  steer.targetPos = STEER_POT_CTR;
+  updateSteering();
+}
+
 // ═════════════════════════════════════════════
 // SERIAL PROTOCOL
 // ═════════════════════════════════════════════
@@ -153,6 +168,7 @@ void releaseBrake() {
 //   {"cmd":"estop"}                       // full brake + latched (requires release to clear)
 //   {"cmd":"brake_reset"}                 // resync estimate to 0 without moving — use after manually releasing
 //   {"cmd":"enable","axis":"steer","on":true}
+//   {"cmd":"calibrate"}                   // run steer full left → full right to calibrate pot min/max
 //
 // Telemetry OUT (every TELEM_MS ms):
 //   {"sp":606,"st":606,"bf":0.00,"bt":0.00,"es":false}
@@ -201,6 +217,8 @@ void processSerial() {
               digitalWrite(STEER_R_EN, steer.enabled ? HIGH : LOW);
               digitalWrite(STEER_L_EN, steer.enabled ? HIGH : LOW);
             }
+          }else if (strcmp(cmd, "calibrate") == 0) {
+            calibrateSteer();
           }
         }
       }
@@ -245,7 +263,9 @@ void setup() {
   steer.targetPos  = steer.currentPos;
 
   // Boot safe: full brake — host must send {"cmd":"release"} to move
-  fullBrake();
+  // fullBrake(); 
+  // there is no sensor to see if its already fully applied, 
+  // so just assume it is. 
 
   wdt_reset();
   Serial.println("{\"status\":\"ready\",\"brake\":\"applied\"}");

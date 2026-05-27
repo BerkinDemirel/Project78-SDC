@@ -7,8 +7,10 @@ import math
 import sys
 from collections import deque
 from tkinter import *
-from python_code.kart_control import KartController, angle_to_fraction
+from kart_control import KartController, angle_to_fraction
 
+
+# todo!! make line more curvable and make noise filter more robus
 # ── Kart control ──────────────────────────────────────────────────────────────
 
 KART_PORT    = "/dev/ttyUSB0"   # Linux (Jetson). Change to "COM3" etc. for Windows.
@@ -16,7 +18,8 @@ KART_ENABLED = True             # set False to run vision-only without hardware
 
 # ── YOLO model ────────────────────────────────────────────────────────────────
 
-model = YOLO('best.pt')
+YOLO_ENABLED = False             # set False to skip object detection entirely
+model        = YOLO('best.pt') if YOLO_ENABLED else None
 
 # ── Steering settings ─────────────────────────────────────────────────────────
 
@@ -58,8 +61,8 @@ class FrameCapture:
         cap = cv2.VideoCapture(self.source, cv2.CAP_V4L2)
         if not cap.isOpened():
             raise RuntimeError(f"Error: Could not open camera source: {self.source}")
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
         cap.set(cv2.CAP_PROP_FPS,          30)
         cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
         return cap
