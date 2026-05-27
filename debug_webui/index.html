@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SDC Steering Test Panel</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Barlow:wght@400;500;600&display=swap');
+
+  :root {
+    --bg: #0f1117;
+    --bg2: #181c27;
+    --bg3: #1e2333;
+    --border: rgba(255,255,255,0.08);
+    --border2: rgba(255,255,255,0.14);
+    --text: #e8eaf0;
+    --muted: #7a809a;
+    --green: #2ecc8f;
+    --amber: #f5a623;
+    --red: #e84040;
+    --blue: #4e9fff;
+    --purple: #9b7fff;
+    --font: 'Barlow', sans-serif;
+    --mono: 'JetBrains Mono', monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; min-height: 100vh; padding: 24px; }
+
+  h1 { font-size: 18px; font-weight: 600; letter-spacing: .02em; }
+  .subtitle { font-size: 12px; color: var(--muted); font-family: var(--mono); margin-top: 2px; }
+
+  .header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 20px; }
+  .header-right { display: flex; gap: 10px; align-items: center; }
+
+  .badge {
+    font-family: var(--mono); font-size: 11px; padding: 3px 10px;
+    border-radius: 4px; font-weight: 500; letter-spacing: .04em;
+  }
+  .badge.connected { background: rgba(46,204,143,.15); color: var(--green); border: 1px solid rgba(46,204,143,.3); }
+  .badge.disconnected { background: rgba(245,166,35,.1); color: var(--amber); border: 1px solid rgba(245,166,35,.25); }
+  .badge.estopped { background: rgba(232,64,64,.15); color: var(--red); border: 1px solid rgba(232,64,64,.3); }
+
+  .grid { display: grid; grid-template-columns: 1fr 260px; gap: 16px; margin-bottom: 16px; }
+  .grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+
+  .card {
+    background: var(--bg2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px;
+  }
+  .card-label {
+    font-size: 10px; font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--muted); margin-bottom: 12px; font-family: var(--mono);
+  }
+
+  .metric-card { background: var(--bg3); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
+  .metric-val { font-family: var(--mono); font-size: 26px; font-weight: 500; line-height: 1; }
+  .metric-lbl { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: var(--mono); }
+
+  /* Slider */
+  .steer-slider-wrap { position: relative; margin: 8px 0 16px; }
+  input[type=range] {
+    -webkit-appearance: none; width: 100%; height: 6px;
+    background: var(--bg3); border-radius: 3px; border: 1px solid var(--border2); outline: none; cursor: pointer;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 20px; height: 20px; border-radius: 50%;
+    background: var(--text); border: 2px solid var(--bg2); cursor: pointer;
+    box-shadow: 0 0 8px rgba(255,255,255,.2);
+  }
+  .slider-labels { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .slider-val { text-align: center; font-family: var(--mono); font-size: 28px; font-weight: 500; margin: 8px 0; }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 7px 14px; border-radius: 6px; border: 1px solid var(--border2);
+    background: var(--bg3); color: var(--text); font-family: var(--font); font-size: 13px;
+    cursor: pointer; transition: background .12s, border-color .12s;
+  }
+  .btn:hover { background: rgba(255,255,255,.07); border-color: var(--border2); }
+  .btn:active { transform: scale(.97); }
+  .btn:disabled { opacity: .35; cursor: not-allowed; transform: none; }
+  .btn.primary { background: rgba(78,159,255,.12); border-color: rgba(78,159,255,.3); color: var(--blue); }
+  .btn.primary:hover { background: rgba(78,159,255,.2); }
+  .btn.danger { background: rgba(232,64,64,.1); border-color: rgba(232,64,64,.3); color: var(--red); }
+  .btn.danger:hover { background: rgba(232,64,64,.18); }
+  .btn.success { background: rgba(46,204,143,.1); border-color: rgba(46,204,143,.3); color: var(--green); }
+  .btn.success:hover { background: rgba(46,204,143,.18); }
+  .btn-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+
+  /* Arc gauge */
+  #arc { display: block; width: 100%; }
+
+  /* Log */
+  .log {
+    font-family: var(--mono); font-size: 12px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; height: 180px; overflow-y: auto; line-height: 1.7;
+  }
+  .log .tx { color: var(--green); }
+  .log .rx { color: var(--blue); }
+  .log .err { color: var(--red); }
+  .log .warn { color: var(--amber); }
+
+  .log::-webkit-scrollbar { width: 4px; }
+  .log::-webkit-scrollbar-track { background: transparent; }
+  .log::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
+
+  /* Progress bar for sequences */
+  .seq-bar-wrap { height: 4px; background: var(--bg3); border-radius: 2px; margin-top: 10px; overflow: hidden; display: none; }
+  .seq-bar { height: 100%; background: var(--purple); border-radius: 2px; transition: width .3s; }
+
+  /* No WebSerial warning */
+  .warning-banner {
+    background: rgba(245,166,35,.08); border: 1px solid rgba(245,166,35,.25);
+    border-radius: 8px; padding: 12px 16px; margin-bottom: 16px;
+    font-size: 13px; color: var(--amber); display: none;
+  }
+
+  svg text { font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<div class="warning-banner" id="no-serial-warn">
+  ⚠ WebSerial not available. Open this file in Chrome or Edge (not Firefox/Safari). Make sure you're on <code>file://</code> or <code>localhost</code>, not a remote URL.
+</div>
+
+<div class="header">
+  <div>
+    <h1>SDC · Steering Test Panel</h1>
+    <div class="subtitle">BTS7960B · closed-loop P · 115200 baud</div>
+  </div>
+  <div class="header-right">
+    <span class="badge disconnected" id="conn-badge">DISCONNECTED</span>
+    <button class="btn primary" id="conn-btn" onclick="toggleConnect()">⬡ Connect serial</button>
+  </div>
+</div>
+
+<div class="grid3">
+  <div class="metric-card">
+    <div class="metric-val" id="met-pot" style="color:var(--green)">—</div>
+    <div class="metric-lbl">pot (raw 0–1023)</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-val" id="met-target" style="color:var(--amber)">—</div>
+    <div class="metric-lbl">target (raw)</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-val" id="met-brake">—</div>
+    <div class="metric-lbl">brake fraction</div>
+  </div>
+  <div class="metric-card">
+    <div class="metric-val" id="met-es" style="color:var(--muted)">—</div>
+    <div class="metric-lbl">e-stopped</div>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Left: controls -->
+  <div>
+    <div class="card" style="margin-bottom:16px">
+      <div class="card-label">Manual steer</div>
+      <div class="slider-val" id="slider-display">0.00</div>
+      <div class="steer-slider-wrap">
+        <input type="range" min="-100" max="100" value="0" step="1" id="steer-slider" oninput="onSlider(this.value)">
+        <div class="slider-labels"><span>−1.0 (left)</span><span>centre</span><span>+1.0 (right)</span></div>
+      </div>
+      <div class="btn-row">
+        <button class="btn success" onclick="sendCmd({cmd:'release'})">↑ Release brake</button>
+        <button class="btn" onclick="centreSteer()">⊕ Centre</button>
+        <button class="btn danger" onclick="sendCmd({cmd:'estop'})">⊗ E-STOP</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Sequence tests</div>
+      <div class="btn-row">
+        <button class="btn" id="seq-sweep" onclick="runSweep()">↔ Full sweep</button>
+        <button class="btn" id="seq-step" onclick="runStep()">↕ Step test</button>
+        <button class="btn" id="seq-slalom" onclick="runSlalom()">∿ Slalom</button>
+        <button class="btn" id="seq-ramp" onclick="runRamp()">/ Ramp</button>
+        <button class="btn danger" id="seq-stop" onclick="stopSeq()" disabled>■ Stop</button>
+      </div>
+      <div class="seq-bar-wrap" id="seq-bar-wrap"><div class="seq-bar" id="seq-bar"></div></div>
+      <div style="font-family:var(--mono);font-size:11px;color:var(--muted);margin-top:8px" id="seq-status">idle</div>
+    </div>
+  </div>
+
+  <!-- Right: arc gauge -->
+  <div class="card" style="display:flex;flex-direction:column;align-items:center;justify-content:center">
+    <div class="card-label" style="align-self:flex-start">Steering angle</div>
+    <canvas id="arc" width="228" height="148"></canvas>
+    <div style="display:flex;gap:16px;margin-top:8px;font-family:var(--mono);font-size:11px">
+      <span style="color:var(--green)">● position</span>
+      <span style="color:var(--amber)">● target</span>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+    <div class="card-label" style="margin:0">Serial log</div>
+    <button class="btn" onclick="clearLog()" style="padding:4px 10px;font-size:12px">Clear</button>
+  </div>
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+let port = null, writer = null, seqTimer = null, seqStep = 0, seqTotal = 0;
+const logEl = document.getElementById('log');
+
+if (!navigator.serial) {
+  document.getElementById('no-serial-warn').style.display = 'block';
+}
+
+function ts() { return new Date().toTimeString().slice(0,8); }
+function addLog(cls, txt) {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.textContent = ts() + '  ' + txt;
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function clearLog() { logEl.innerHTML = ''; }
+
+async function toggleConnect() {
+  if (port) { await doDisconnect(); return; }
+  if (!navigator.serial) { addLog('err', 'WebSerial not available — use Chrome/Edge'); return; }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+    writer = port.writable.getWriter();
+    setBadge('connected');
+    document.getElementById('conn-btn').textContent = '⬡ Disconnect';
+    addLog('tx', 'Port opened — 115200 baud');
+    readLoop();
+  } catch(e) {
+    addLog('err', 'Connect failed: ' + e.message);
+    port = null;
+  }
+}
+async function doDisconnect() {
+  stopSeq();
+  try { writer && await writer.close(); await port.close(); } catch(e) {}
+  port = null; writer = null;
+  setBadge('disconnected');
+  document.getElementById('conn-btn').textContent = '⬡ Connect serial';
+  addLog('warn', 'Disconnected');
+}
+
+function setBadge(state) {
+  const b = document.getElementById('conn-badge');
+  b.className = 'badge ' + state;
+  b.textContent = state.toUpperCase();
+}
+
+async function readLoop() {
+  const dec = new TextDecoderStream();
+  port.readable.pipeTo(dec.writable);
+  const reader = dec.readable.getReader();
+  let buf = '';
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += value;
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (line) { addLog('rx', line); parseTelem(line); }
+      }
+    }
+  } catch(e) { addLog('err', 'Read error: ' + e.message); }
+}
+
+function parseTelem(line) {
+  try {
+    const d = JSON.parse(line);
+    if ('sp' in d) {
+      document.getElementById('met-pot').textContent = d.sp;
+      document.getElementById('met-target').textContent = d.st;
+      document.getElementById('met-brake').textContent = parseFloat(d.bf).toFixed(2);
+      const esEl = document.getElementById('met-es');
+      esEl.textContent = d.es ? 'YES' : 'no';
+      esEl.style.color = d.es ? 'var(--red)' : 'var(--muted)';
+      if (d.es) setBadge('estopped');
+      drawArc(d.sp, d.st);
+    }
+    if (d.watchdog) addLog('warn', '⚠ Watchdog fired — brake applied');
+    if (d.estop)    addLog('warn', '⚠ E-stop acknowledged');
+  } catch(e) {}
+}
+
+async function sendCmd(obj) {
+  const msg = JSON.stringify(obj) + '\n';
+  addLog('tx', msg.trim());
+  if (!writer) { addLog('err', 'Not connected'); return; }
+  await writer.write(new TextEncoder().encode(msg));
+}
+
+function onSlider(v) {
+  const f = (parseInt(v) / 100).toFixed(2);
+  document.getElementById('slider-display').textContent = f;
+  sendCmd({ cmd: 'steer', value: parseFloat(f) });
+}
+function centreSteer() {
+  document.getElementById('steer-slider').value = 0;
+  document.getElementById('slider-display').textContent = '0.00';
+  sendCmd({ cmd: 'steer', value: 0 });
+}
+
+// ── Sequences ──────────────────────────────────────────────────────────
+
+function setSeqBtns(running) {
+  ['seq-sweep','seq-step','seq-slalom','seq-ramp'].forEach(id => document.getElementById(id).disabled = running);
+  document.getElementById('seq-stop').disabled = !running;
+  const wrap = document.getElementById('seq-bar-wrap');
+  wrap.style.display = running ? 'block' : 'none';
+}
+
+function setSeqStatus(txt) { document.getElementById('seq-status').textContent = txt; }
+
+function setSeqProgress(i, total) {
+  document.getElementById('seq-bar').style.width = Math.round(i / total * 100) + '%';
+}
+
+function stopSeq() {
+  if (seqTimer) { clearTimeout(seqTimer); seqTimer = null; }
+  setSeqBtns(false);
+  setSeqStatus('idle');
+  setSeqProgress(0, 1);
+}
+
+function runSeq(steps, dwellMs) {
+  stopSeq();
+  seqStep = 0; seqTotal = steps.length;
+  setSeqBtns(true);
+  sendCmd({ cmd: 'release' });
+  function next() {
+    if (seqStep >= steps.length) { stopSeq(); setSeqStatus('done'); return; }
+    const s = steps[seqStep];
+    setSeqStatus('step ' + (seqStep + 1) + '/' + steps.length + '  →  ' + s.toFixed(2));
+    setSeqProgress(seqStep + 1, steps.length);
+    sendCmd({ cmd: 'steer', value: s });
+    seqStep++;
+    seqTimer = setTimeout(next, dwellMs);
+  }
+  setTimeout(next, 800);
+}
+
+function runSweep()  { runSeq([-1,-0.75,-0.5,-0.25,0,0.25,0.5,0.75,1,0.75,0.5,0.25,0], 1800); }
+function runStep()   { runSeq([0,-1,0,1,0,-0.5,0,0.5,0,-0.25,0.25,0], 2000); }
+function runSlalom() { runSeq([-0.6,0.6,-0.6,0.6,-0.4,0.4,-0.4,0.4,-0.2,0.2,0], 1200); }
+function runRamp() {
+  const steps = [];
+  for (let i = -20; i <= 20; i++) steps.push(i / 20);
+  runSeq(steps, 300);
+}
+
+// ── Arc gauge ──────────────────────────────────────────────────────────
+
+function drawArc(sp, st) {
+  const c = document.getElementById('arc');
+  const ctx = c.getContext('2d');
+  const W = c.width, H = c.height;
+  const cx = W / 2, cy = H - 16, r = 100;
+  ctx.clearRect(0, 0, W, H);
+
+  // Track
+  ctx.beginPath(); ctx.arc(cx, cy, r, Math.PI, 0);
+  ctx.strokeStyle = '#2a2f40'; ctx.lineWidth = 12; ctx.stroke();
+
+  // Tick marks
+  for (let i = 0; i <= 10; i++) {
+    const a = Math.PI + (i / 10) * Math.PI;
+    const x1 = cx + (r - 16) * Math.cos(a), y1 = cy - (r - 16) * Math.sin(a);
+    const x2 = cx + (r - 6)  * Math.cos(a), y2 = cy - (r - 6)  * Math.sin(a);
+    ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+    ctx.strokeStyle = i % 5 === 0 ? '#444' : '#2a2f40';
+    ctx.lineWidth = i % 5 === 0 ? 2 : 1; ctx.stroke();
+  }
+
+  function drawNeedle(raw, color, thick) {
+    if (raw === undefined || raw === null) return;
+    const frac = raw / 1023;
+    const a = Math.PI + frac * Math.PI;
+    const nx = cx + r * Math.cos(a), ny = cy - r * Math.sin(a);
+    // Arc highlight
+    ctx.beginPath(); ctx.arc(cx, cy, r, Math.PI, a);
+    ctx.strokeStyle = color + '40'; ctx.lineWidth = 12; ctx.stroke();
+    // Needle
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(nx, ny);
+    ctx.strokeStyle = color; ctx.lineWidth = thick;
+    ctx.lineCap = 'round'; ctx.stroke();
+    // Tip dot
+    ctx.beginPath(); ctx.arc(nx, ny, 5, 0, 2 * Math.PI);
+    ctx.fillStyle = color; ctx.fill();
+  }
+
+  drawNeedle(sp, '#2ecc8f', 3);
+  drawNeedle(st, '#f5a623', 2);
+
+  // Centre pivot
+  ctx.beginPath(); ctx.arc(cx, cy, 7, 0, 2 * Math.PI);
+  ctx.fillStyle = '#e8eaf0'; ctx.fill();
+
+  // Labels
+  ctx.fillStyle = '#7a809a'; ctx.font = '11px JetBrains Mono, monospace'; ctx.textAlign = 'center';
+  ctx.fillText('L', cx - r + 4, cy + 14);
+  ctx.fillText('R', cx + r - 4, cy + 14);
+  ctx.fillText('CTR', cx, cy + 14);
+}
+
+drawArc(512, 512);
+</script>
+</body>
+</html>
