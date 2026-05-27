@@ -31,7 +31,7 @@ KART_PORT    = "/dev/ttyUSB0"
 KART_ENABLED = True
 
 # ── YOLO ──────────────────────────────────────────────────────────────────────
-YOLO_ENABLED = False   # toggle with 'o' key at runtime
+YOLO_ENABLED = True   # toggle with 'o' key at runtime
 
 model = YOLO('object_models/best.pt') if YOLO_ENABLED else None
 
