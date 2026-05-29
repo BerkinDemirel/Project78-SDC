@@ -110,14 +110,16 @@ frame_count  = 0
 
 @dataclass
 class LaneState:
-    left_poly:    Optional[np.ndarray] = None
-    right_poly:   Optional[np.ndarray] = None
-    left_conf:    float = 0.0
-    right_conf:   float = 0.0
-    error_hist:   List[float] = field(default_factory=list)
+    left_poly:      Optional[np.ndarray] = None
+    right_poly:     Optional[np.ndarray] = None
+    left_conf:      float = 0.0
+    right_conf:     float = 0.0
+    error_hist:     List[float] = field(default_factory=list)
     # True = actually detected this frame; False = estimated from the other side
-    left_real:    bool = False
-    right_real:   bool = False
+    left_real:      bool = False
+    right_real:     bool = False
+    # Last mid computed when both lines were genuinely detected
+    last_known_mid: Optional[int] = None
 
 
 # ──────────────────────────────────────────────
@@ -287,11 +289,10 @@ def _remove_small_blobs(mask, min_area=DOT_MIN_AREA):
     Kills road studs / cat's-eyes which are small circular blobs,
     while leaving lane-line stripes (large elongated regions) intact.
     """
-    # Label every connected white region
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         mask, connectivity=8)
     clean = np.zeros_like(mask)
-    for lbl in range(1, num_labels):          # label 0 is background
+    for lbl in range(1, num_labels):
         if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
             clean[labels == lbl] = 255
     return clean
@@ -322,9 +323,7 @@ def _edge_image(frame):
                               np.array([35,  255, 255]))
 
     # ── Step 2: morphological open on white mask ──────────────────────────
-    # A 7×7 ellipse erodes away blobs narrower than ~7 px in any direction
-    # (road studs), then dilates back to restore wider stripe edges.
-    dot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    dot_kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
     white_clean = cv2.morphologyEx(white, cv2.MORPH_OPEN, dot_kernel,
                                    iterations=1)
 
@@ -391,8 +390,8 @@ def _detect_lines_worker(frame, state: LaneState):
 
     left_xs, left_ys, right_xs, right_ys = [], [], [], []
     cx           = w / 2
-    left_x_max   = w * LEFT_X_MAX_FRAC   # left candidates must be left of this
-    right_x_min  = w * RIGHT_X_MIN_FRAC  # right candidates must be right of this
+    left_x_max   = w * LEFT_X_MAX_FRAC
+    right_x_min  = w * RIGHT_X_MIN_FRAC
 
     if lines is not None:
         for ln in lines:
@@ -404,13 +403,9 @@ def _detect_lines_worker(frame, state: LaneState):
                 continue
             mid_x = (x1 + x2) / 2
 
-            # Left lane: negative slope (converges toward vanishing point on left)
-            # AND midpoint is in the left portion of the frame
             if slope < 0 and mid_x < left_x_max:
                 left_xs  += [x1, x2]
                 left_ys  += [y1, y2]
-
-            # Right lane: positive slope AND midpoint in the right portion
             elif slope > 0 and mid_x > right_x_min:
                 right_xs += [x1, x2]
                 right_ys += [y1, y2]
@@ -444,21 +439,42 @@ def _compute_steering(frame_width, left_pts, right_pts, state: LaneState):
     lx = left_pts[0][0]  if left_pts  else None
     rx = right_pts[0][0] if right_pts else None
 
-    if lx is not None and rx is not None:
+    if state.left_real and state.right_real:
+        # Both lines genuinely detected — best case, update the stored mid
         lane_center = (lx + rx) // 2
-    elif lx is not None:
+        state.last_known_mid = lane_center
+
+    elif state.left_real and state.last_known_mid is not None:
+        # Right line lost (e.g. exiting a turn): mirror left line across last mid
+        # dist = how far left line was from centre when both were visible
+        dist = state.last_known_mid - lx
+        lane_center = lx + dist   # equivalent to last_known_mid, tracks with line
+
+    elif state.right_real and state.last_known_mid is not None:
+        # Left line lost: mirror right line across last mid
+        dist = rx - state.last_known_mid
+        lane_center = rx - dist   # equivalent to last_known_mid, tracks with line
+
+    elif state.left_real:
+        # Right lost and no mid history yet — fall back to assumed width
         lane_center = lx + int(ASSUMED_LANE_WIDTH_FRAC * frame_width / 2)
-    elif rx is not None:
+
+    elif state.right_real:
+        # Left lost and no mid history yet — fall back to assumed width
         lane_center = rx - int(ASSUMED_LANE_WIDTH_FRAC * frame_width / 2)
+
     else:
-        # Complete loss — hold last error and decay
-        last = state.error_hist[-1] if state.error_hist else 0.0
-        state.error_hist.append(last)
-        if len(state.error_hist) > MAX_HISTORY:
-            state.error_hist.pop(0)
-        smoothed = np.mean(state.error_hist)
-        return float(np.clip(smoothed * STEERING_ANGLE_LIMIT,
-                             -STEERING_ANGLE_LIMIT, STEERING_ANGLE_LIMIT))
+        # Complete loss — hold last known mid or decay from last error
+        if state.last_known_mid is not None:
+            lane_center = state.last_known_mid
+        else:
+            last = state.error_hist[-1] if state.error_hist else 0.0
+            state.error_hist.append(last)
+            if len(state.error_hist) > MAX_HISTORY:
+                state.error_hist.pop(0)
+            smoothed = np.mean(state.error_hist)
+            return float(np.clip(smoothed * STEERING_ANGLE_LIMIT,
+                                 -STEERING_ANGLE_LIMIT, STEERING_ANGLE_LIMIT))
 
     error      = lane_center - cx
     normalized = float(np.clip(error / (frame_width * 0.30), -1.0, 1.0))
@@ -633,7 +649,6 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
         if state.left_real:
             draw_polyline(left_pts, (0, 220, 0), thickness=6)
         else:
-            # Draw dashed to make it obvious this is a guess
             for i in range(0, len(left_pts) - 1, 2):
                 cv2.line(overlay, left_pts[i], left_pts[i + 1],
                          (120, 120, 80), 4, cv2.LINE_AA)
@@ -690,15 +705,29 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
                 return int(pts[i][0] + t * (pts[i + 1][0] - pts[i][0]))
         return None
 
-    lx_sl = _x_at_y(left_pts,  sl_y)
-    rx_sl = _x_at_y(right_pts, sl_y)
+    lx_sl = _x_at_y(left_pts,  sl_y) if state.left_real  else None
+    rx_sl = _x_at_y(right_pts, sl_y) if state.right_real else None
 
     if lx_sl is not None and rx_sl is not None:
         lane_cx = (lx_sl + rx_sl) // 2
+
+    elif lx_sl is not None and state.last_known_mid is not None:
+        dist    = state.last_known_mid - lx_sl
+        lane_cx = lx_sl + dist
+
+    elif rx_sl is not None and state.last_known_mid is not None:
+        dist    = rx_sl - state.last_known_mid
+        lane_cx = rx_sl - dist
+
     elif lx_sl is not None:
         lane_cx = lx_sl + int(ASSUMED_LANE_WIDTH_FRAC * w / 2)
+
     elif rx_sl is not None:
         lane_cx = rx_sl - int(ASSUMED_LANE_WIDTH_FRAC * w / 2)
+
+    elif state.last_known_mid is not None:
+        lane_cx = state.last_known_mid
+
     else:
         lane_cx = cx
 
@@ -744,10 +773,8 @@ def build_display(base_frame, boxes_frame, left_pts, right_pts,
                   fps_window, prev_time, font,
                   traffic_state=DriveState.DRIVING, traffic_text="DRIVING"):
 
-    # boxes_frame is None when YOLO is OFF → use raw frame
     display = boxes_frame.copy() if boxes_frame is not None else base_frame.copy()
 
-    # Lane overlay (trapezoid ROI + steering line baked in)
     display = draw_lanes(display, left_pts, right_pts, lane_state, steering_angle)
 
     direction = "RIGHT" if steering_angle > 0 else "LEFT" if steering_angle < 0 else "STRAIGHT"
@@ -760,18 +787,15 @@ def build_display(base_frame, boxes_frame, left_pts, right_pts,
     cv2.putText(display, f"FPS: {avg_fps:.1f}",
                 (10, 80), font, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
 
-    # Confidence readout
     cv2.putText(display,
                 f"L:{lane_state.left_conf:.2f}  R:{lane_state.right_conf:.2f}",
                 (10, 115), font, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
 
-    # Traffic state banner
     colour = _STATE_COLOURS.get(traffic_state, (200, 200, 200))
     cv2.rectangle(display, (0, 130), (620, 162), (30, 30, 30), -1)
     cv2.putText(display, f"Traffic: {traffic_text}",
                 (10, 154), font, 0.9, colour, 2, cv2.LINE_AA)
 
-    # YOLO OFF badge (top-right)
     if not YOLO_ENABLED:
         bw, bh = 130, 28
         bx = display.shape[1] - bw - 10
@@ -945,7 +969,6 @@ def run_on_video(path):
                 fps_window, prev_time, font,
                 traffic.state, status_text)
 
-            # Progress bar
             bar_w = int(display.shape[1] * frame_count / max(total, 1))
             cv2.rectangle(display,
                           (0, display.shape[0] - 6),
