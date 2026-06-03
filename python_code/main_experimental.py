@@ -22,7 +22,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from tkinter import *
-from typing import Optional, Tuple, List
+from typing import Optional, List
 from kart_control import KartController, angle_to_fraction
 
 # ── Kart control ──────────────────────────────────────────────────────────────
@@ -41,19 +41,12 @@ YOLO_ENABLED = False   # toggle with 'o' key at runtime
 STEERING_ANGLE_LIMIT = 90.0
 
 # ── ROI trapezoid (fractions of frame size) ───────────────────────────────────
-# Trapezoid is better than rectangle: cuts the far-left opposite-carriageway
-# line while still capturing both lane lines at distance.
-#
-#   Top edge (narrow): spans 20%–80% of width at 45% height
-#   Bottom edge (wider): spans 5%–95% of width at 95% height
-#
-# Tweak ROI_TOP_LEFT / ROI_TOP_RIGHT first if one lane is still missed.
 
 ROI_TOP_Y     = 0.3
 ROI_BOTTOM_Y  = 0.95
-ROI_TOP_LEFT  = 0.20   # wider top catches left line earlier
+ROI_TOP_LEFT  = 0.20
 ROI_TOP_RIGHT = 0.80
-ROI_BOT_LEFT  = 0   # small inset keeps the opposite-lane line out
+ROI_BOT_LEFT  = 0
 ROI_BOT_RIGHT = 1
 
 # ── Lane detection tuning ─────────────────────────────────────────────────────
@@ -62,25 +55,17 @@ POLY_DEGREE            = 2
 ALPHA_FRESH            = 0.35
 ALPHA_MEDIUM           = 0.15
 ALPHA_STALE            = 0.04
-MIN_VERTICAL_SPAN_FRAC = 0.15   # lowered: accept shorter left-line segments
+MIN_VERTICAL_SPAN_FRAC = 0.15
 ASSUMED_LANE_WIDTH_FRAC= 0.6
 MAX_HISTORY            = 7
 N_POLY_POINTS          = 20
 HOUGH_THRESHOLD        = 30
-HOUGH_MIN_LEN          = 60    # raised back: dots are killed before Hough now
+HOUGH_MIN_LEN          = 60
 HOUGH_MAX_GAP          = 120
 HOUGH_MIN_SLOPE        = 0.40
 
-# ── Dot / road-stud filter ────────────────────────────────────────────────────
-# White blobs smaller than this pixel area are removed from the colour mask
-# before edge detection. Cat's-eyes / road studs are ~10-40 px² at typical
-# driving distance; a real lane-line stripe is hundreds of px².
-DOT_MIN_AREA = 5000   # blobs below this area are considered noise and dropped
+DOT_MIN_AREA = 5000
 
-# X-zone: each lane candidate must physically be on the correct side.
-# Left candidates:  midpoint x < LEFT_X_MAX   (fraction of width)
-# Right candidates: midpoint x > RIGHT_X_MIN  (fraction of width)
-# Widened to 0.60 / 0.40 so a line that crosses centre slightly still qualifies.
 LEFT_X_MAX_FRAC  = 0.60
 RIGHT_X_MIN_FRAC = 0.40
 
@@ -115,10 +100,8 @@ class LaneState:
     left_conf:      float = 0.0
     right_conf:     float = 0.0
     error_hist:     List[float] = field(default_factory=list)
-    # True = actually detected this frame; False = estimated from the other side
     left_real:      bool = False
     right_real:     bool = False
-    # Last mid computed when both lines were genuinely detected
     last_known_mid: Optional[int] = None
 
 
@@ -151,12 +134,16 @@ class TrafficStateController:
         print(f"[TRAFFIC] {self.state.value} → {new_state.value}{tag}")
         self.state       = new_state
         self.state_start = time.time()
+
         if new_state == DriveState.BRAKING:
             if kart: kart.brake(1.0)
         elif new_state in (DriveState.STOPPED_SIGN, DriveState.STOPPED_RED):
             if kart: kart.brake(1.0)
         elif new_state == DriveState.RESUMING:
-            if kart: kart.release()
+            # Release brake then re-enable motor so DAC comes back up
+            if kart:
+                kart.release()
+                kart.start()
 
     def update(self, detections, kart):
         now     = time.time()
@@ -174,19 +161,23 @@ class TrafficStateController:
                 self._brake_cause = "red"
                 self._transition(DriveState.BRAKING, kart,
                                  reason=f"red light {red_det['confidence']:.2f}")
+
         elif self.state == DriveState.BRAKING:
             if elapsed >= BRAKE_RAMP_DURATION:
                 if self._brake_cause == "sign":
                     self._transition(DriveState.STOPPED_SIGN, kart)
                 else:
                     self._transition(DriveState.STOPPED_RED, kart)
+
         elif self.state == DriveState.STOPPED_SIGN:
             if elapsed >= STOP_HOLD_DURATION:
                 self._transition(DriveState.RESUMING, kart, reason="10 s elapsed")
+
         elif self.state == DriveState.STOPPED_RED:
             if green_det:
                 self._transition(DriveState.RESUMING, kart,
                                  reason=f"green light {green_det['confidence']:.2f}")
+
         elif self.state == DriveState.RESUMING:
             if elapsed >= 0.5:
                 self._transition(DriveState.DRIVING, kart)
@@ -270,7 +261,6 @@ class FrameCapture:
 # ──────────────────────────────────────────────
 
 def _roi_mask(shape):
-    """Trapezoid ROI — narrow at the top (horizon), wide at the bottom (near)."""
     h, w = shape
     mask = np.zeros((h, w), dtype=np.uint8)
     pts  = np.array([[
@@ -284,13 +274,7 @@ def _roi_mask(shape):
 
 
 def _remove_small_blobs(mask, min_area=DOT_MIN_AREA):
-    """
-    Remove connected white regions smaller than min_area pixels.
-    Kills road studs / cat's-eyes which are small circular blobs,
-    while leaving lane-line stripes (large elongated regions) intact.
-    """
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        mask, connectivity=8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     clean = np.zeros_like(mask)
     for lbl in range(1, num_labels):
         if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
@@ -299,45 +283,17 @@ def _remove_small_blobs(mask, min_area=DOT_MIN_AREA):
 
 
 def _edge_image(frame):
-    """
-    Produce an edge image that highlights white and yellow lane markings
-    while suppressing road studs / cat's-eyes (small white dots).
-
-    Pipeline:
-      1. HLS colour mask for white and yellow markings.
-      2. Morphological opening (erode then dilate) on the white mask —
-         this removes blobs that are thinner than the structuring element,
-         i.e. dots, while keeping wider stripes.
-      3. Connected-component area filter — any remaining blob smaller than
-         DOT_MIN_AREA pixels is dropped entirely.
-      4. CLAHE + Gaussian blur + Canny on the L channel.
-      5. AND the edge image with the cleaned colour mask.
-    """
     hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
-
-    # White: broad lightness range — catches faded/shaded markings
-    white  = cv2.inRange(hls, np.array([0,   130,   0]),
-                              np.array([255, 255,  60]))
-    # Yellow: standard road-marking hue
-    yellow = cv2.inRange(hls, np.array([15,   80,  80]),
-                              np.array([35,  255, 255]))
-
-    # ── Step 2: morphological open on white mask ──────────────────────────
+    white  = cv2.inRange(hls, np.array([0, 130,  0]), np.array([255, 255,  60]))
+    yellow = cv2.inRange(hls, np.array([15,  80, 80]), np.array([35,  255, 255]))
     dot_kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    white_clean = cv2.morphologyEx(white, cv2.MORPH_OPEN, dot_kernel,
-                                   iterations=1)
-
-    # ── Step 3: connected-component area filter ───────────────────────────
+    white_clean = cv2.morphologyEx(white, cv2.MORPH_OPEN, dot_kernel, iterations=1)
     white_clean = _remove_small_blobs(white_clean, DOT_MIN_AREA)
-
-    color_mask = cv2.bitwise_or(white_clean, yellow)
-
-    # ── Steps 4 & 5: edges on CLAHE-enhanced L channel ───────────────────
-    l, a, b = cv2.split(cv2.cvtColor(frame, cv2.COLOR_BGR2LAB))
-    cl      = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
-    blur    = cv2.GaussianBlur(cl, (7, 7), 0)
-    edges   = cv2.Canny(blur, 50, 150)
-
+    color_mask  = cv2.bitwise_or(white_clean, yellow)
+    l, _, _     = cv2.split(cv2.cvtColor(frame, cv2.COLOR_BGR2LAB))
+    cl   = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
+    blur = cv2.GaussianBlur(cl, (7, 7), 0)
+    edges = cv2.Canny(blur, 50, 150)
     return cv2.bitwise_and(edges, color_mask)
 
 
@@ -376,9 +332,9 @@ def _smooth_poly(current, previous, conf):
 
 
 def _detect_lines_worker(frame, state: LaneState):
-    h, w    = frame.shape[:2]
-    y_top   = int(h * ROI_TOP_Y)
-    y_bot   = int(h * ROI_BOTTOM_Y)
+    h, w  = frame.shape[:2]
+    y_top = int(h * ROI_TOP_Y)
+    y_bot = int(h * ROI_BOTTOM_Y)
     edges   = _edge_image(frame)
     mask    = _roi_mask((h, w))
     cropped = cv2.bitwise_and(edges, mask)
@@ -389,9 +345,8 @@ def _detect_lines_worker(frame, state: LaneState):
                             maxLineGap=HOUGH_MAX_GAP)
 
     left_xs, left_ys, right_xs, right_ys = [], [], [], []
-    cx           = w / 2
-    left_x_max   = w * LEFT_X_MAX_FRAC
-    right_x_min  = w * RIGHT_X_MIN_FRAC
+    left_x_max  = w * LEFT_X_MAX_FRAC
+    right_x_min = w * RIGHT_X_MIN_FRAC
 
     if lines is not None:
         for ln in lines:
@@ -402,28 +357,21 @@ def _detect_lines_worker(frame, state: LaneState):
             if abs(slope) < HOUGH_MIN_SLOPE:
                 continue
             mid_x = (x1 + x2) / 2
-
             if slope < 0 and mid_x < left_x_max:
-                left_xs  += [x1, x2]
-                left_ys  += [y1, y2]
+                left_xs  += [x1, x2]; left_ys  += [y1, y2]
             elif slope > 0 and mid_x > right_x_min:
-                right_xs += [x1, x2]
-                right_ys += [y1, y2]
+                right_xs += [x1, x2]; right_ys += [y1, y2]
 
     new_left,  lc = _fit_poly(left_xs,  left_ys,  h)
     new_right, rc = _fit_poly(right_xs, right_ys, h)
     state.left_poly,  state.left_conf  = _smooth_poly(new_left,  state.left_poly,  lc)
     state.right_poly, state.right_conf = _smooth_poly(new_right, state.right_poly, rc)
-
-    # Track which lines were genuinely detected vs estimated
     state.left_real  = new_left  is not None
     state.right_real = new_right is not None
 
     left_pts  = _sample_poly(state.left_poly,  y_top, y_bot) if state.left_poly  is not None else None
     right_pts = _sample_poly(state.right_poly, y_top, y_bot) if state.right_poly is not None else None
 
-    # Missing lane: draw a parallel copy of the detected line shifted by lane width.
-    # Purely visual — state.left_real / state.right_real stay False so steering ignores it.
     lane_w = int(ASSUMED_LANE_WIDTH_FRAC * w)
     if left_pts is not None and right_pts is None:
         right_pts = [(x + lane_w, y) for x, y in left_pts]
@@ -435,36 +383,21 @@ def _detect_lines_worker(frame, state: LaneState):
 
 def _compute_steering(frame_width, left_pts, right_pts, state: LaneState):
     cx = frame_width // 2
-
     lx = left_pts[0][0]  if left_pts  else None
     rx = right_pts[0][0] if right_pts else None
 
     if state.left_real and state.right_real:
-        # Both lines genuinely detected — best case, update the stored mid
         lane_center = (lx + rx) // 2
         state.last_known_mid = lane_center
-
     elif state.left_real and state.last_known_mid is not None:
-        # Right line lost (e.g. exiting a turn): mirror left line across last mid
-        # dist = how far left line was from centre when both were visible
-        dist = state.last_known_mid - lx
-        lane_center = lx + dist   # equivalent to last_known_mid, tracks with line
-
+        lane_center = lx + (state.last_known_mid - lx)
     elif state.right_real and state.last_known_mid is not None:
-        # Left line lost: mirror right line across last mid
-        dist = rx - state.last_known_mid
-        lane_center = rx - dist   # equivalent to last_known_mid, tracks with line
-
+        lane_center = rx - (rx - state.last_known_mid)
     elif state.left_real:
-        # Right lost and no mid history yet — fall back to assumed width
         lane_center = lx + int(ASSUMED_LANE_WIDTH_FRAC * frame_width / 2)
-
     elif state.right_real:
-        # Left lost and no mid history yet — fall back to assumed width
         lane_center = rx - int(ASSUMED_LANE_WIDTH_FRAC * frame_width / 2)
-
     else:
-        # Complete loss — hold last known mid or decay from last error
         if state.last_known_mid is not None:
             lane_center = state.last_known_mid
         else:
@@ -562,15 +495,11 @@ class YoloDetector:
             if frame is None:
                 time.sleep(0.001)
                 continue
-
-            # ── YOLO toggle ───────────────────────────────────────────────────
             if not YOLO_ENABLED:
                 with self.output_lock:
                     self.detections  = []
                     self.boxes_frame = None
                 continue
-            # ─────────────────────────────────────────────────────────────────
-
             results     = model.predict(source=frame, conf=0.5, stream=False,
                                         half=True, verbose=False)
             boxes_frame = results[0].plot()
@@ -604,154 +533,118 @@ def draw_steering_wheel(canvas, angle, width=300, height=300):
     canvas.delete("all")
     cx, cy = width // 2, height // 2
     radius = min(cx, cy) - 20
-    canvas.create_oval(cx - radius, cy - radius,
-                       cx + radius, cy + radius,
+    canvas.create_oval(cx-radius, cy-radius, cx+radius, cy+radius,
                        outline="#444", width=18, fill="#222")
     hub = radius * 0.18
-    canvas.create_oval(cx - hub, cy - hub, cx + hub, cy + hub,
+    canvas.create_oval(cx-hub, cy-hub, cx+hub, cy+hub,
                        fill="#555", outline="#888", width=2)
-    for spoke_offset in [0, 120, 240]:
-        rad = math.radians(angle + spoke_offset)
-        sx  = cx + radius * 0.85 * math.sin(rad)
-        sy  = cy - radius * 0.85 * math.cos(rad)
-        canvas.create_line(cx, cy, sx, sy, width=8, fill="#888")
-    marker_rad = math.radians(angle)
-    mx = cx + (radius - 8) * math.sin(marker_rad)
-    my = cy - (radius - 8) * math.cos(marker_rad)
-    canvas.create_oval(mx - 7, my - 7, mx + 7, my + 7, fill="red", outline="")
+    for offset in [0, 120, 240]:
+        rad = math.radians(angle + offset)
+        canvas.create_line(cx, cy,
+                           cx + radius*0.85*math.sin(rad),
+                           cy - radius*0.85*math.cos(rad),
+                           width=8, fill="#888")
+    mrad = math.radians(angle)
+    mx = cx + (radius-8)*math.sin(mrad)
+    my = cy - (radius-8)*math.cos(mrad)
+    canvas.create_oval(mx-7, my-7, mx+7, my+7, fill="red", outline="")
     direction = "RIGHT" if angle > 0.5 else "LEFT" if angle < -0.5 else "STRAIGHT"
-    canvas.create_text(cx, cy + radius + 16,
+    canvas.create_text(cx, cy+radius+16,
                        text=f"{angle:.1f}°  {direction}",
                        fill="white", font=("Arial", 13, "bold"))
 
 
 # ──────────────────────────────────────────────
-# DRAW LANES  (ROI outline + steering line)
+# DRAW LANES
 # ──────────────────────────────────────────────
 
-def draw_lanes(frame, left_pts, right_pts, state: LaneState,
-               steering_angle: float = 0.0):
+def draw_lanes(frame, left_pts, right_pts, state: LaneState, steering_angle: float = 0.0):
     h, w    = frame.shape[:2]
     out     = frame.copy()
     overlay = np.zeros_like(out)
 
     def draw_polyline(pts, color, thickness=6):
         for i in range(len(pts) - 1):
-            cv2.line(overlay, pts[i], pts[i + 1], color, thickness, cv2.LINE_AA)
+            cv2.line(overlay, pts[i], pts[i+1], color, thickness, cv2.LINE_AA)
 
-    # Filled lane polygon
     if left_pts and right_pts:
-        poly = np.array(left_pts + right_pts[::-1], dtype=np.int32)
-        cv2.fillPoly(overlay, [poly], (0, 80, 0))
+        cv2.fillPoly(overlay, [np.array(left_pts + right_pts[::-1], dtype=np.int32)], (0, 80, 0))
 
-    # Lane lines: bright green = real detection, blue-grey dashed = estimated
     if left_pts:
         if state.left_real:
-            draw_polyline(left_pts, (0, 220, 0), thickness=6)
+            draw_polyline(left_pts, (0, 220, 0), 6)
         else:
-            for i in range(0, len(left_pts) - 1, 2):
-                cv2.line(overlay, left_pts[i], left_pts[i + 1],
-                         (120, 120, 80), 4, cv2.LINE_AA)
+            for i in range(0, len(left_pts)-1, 2):
+                cv2.line(overlay, left_pts[i], left_pts[i+1], (120,120,80), 4, cv2.LINE_AA)
+
     if right_pts:
         if state.right_real:
-            draw_polyline(right_pts, (0, 220, 0), thickness=6)
+            draw_polyline(right_pts, (0, 220, 0), 6)
         else:
-            for i in range(0, len(right_pts) - 1, 2):
-                cv2.line(overlay, right_pts[i], right_pts[i + 1],
-                         (120, 120, 80), 4, cv2.LINE_AA)
+            for i in range(0, len(right_pts)-1, 2):
+                cv2.line(overlay, right_pts[i], right_pts[i+1], (120,120,80), 4, cv2.LINE_AA)
 
     out = cv2.addWeighted(out, 1.0, overlay, 0.55, 0)
 
-    # ── ROI trapezoid outline (dashed cyan) ──────────────────────────────────
-    roi_pts = np.array([
-        (int(w * ROI_BOT_LEFT),  int(h * ROI_BOTTOM_Y)),
-        (int(w * ROI_TOP_LEFT),  int(h * ROI_TOP_Y)),
-        (int(w * ROI_TOP_RIGHT), int(h * ROI_TOP_Y)),
-        (int(w * ROI_BOT_RIGHT), int(h * ROI_BOTTOM_Y)),
+    roi_pts   = np.array([
+        (int(w*ROI_BOT_LEFT), int(h*ROI_BOTTOM_Y)), (int(w*ROI_TOP_LEFT), int(h*ROI_TOP_Y)),
+        (int(w*ROI_TOP_RIGHT), int(h*ROI_TOP_Y)),   (int(w*ROI_BOT_RIGHT), int(h*ROI_BOTTOM_Y)),
     ], dtype=np.int32)
-    roi_color  = (255, 220, 0)
-    dash, gap  = 14, 8
+    roi_color = (255, 220, 0)
+    dash, gap = 14, 8
     for p1, p2 in zip(roi_pts, np.roll(roi_pts, -1, axis=0)):
-        x1, y1 = int(p1[0]), int(p1[1])
-        x2, y2 = int(p2[0]), int(p2[1])
-        seg    = max(1, int(np.hypot(x2 - x1, y2 - y1)))
-        for s in range(seg // (dash + gap) + 1):
-            t0 = s * (dash + gap) / seg
-            t1 = min(1.0, t0 + dash / seg)
+        x1,y1,x2,y2 = int(p1[0]),int(p1[1]),int(p2[0]),int(p2[1])
+        seg = max(1, int(np.hypot(x2-x1, y2-y1)))
+        for s in range(seg//(dash+gap)+1):
+            t0 = s*(dash+gap)/seg; t1 = min(1.0, t0+dash/seg)
             cv2.line(out,
-                     (int(x1 + t0*(x2-x1)), int(y1 + t0*(y2-y1))),
-                     (int(x1 + t1*(x2-x1)), int(y1 + t1*(y2-y1))),
+                     (int(x1+t0*(x2-x1)), int(y1+t0*(y2-y1))),
+                     (int(x1+t1*(x2-x1)), int(y1+t1*(y2-y1))),
                      roi_color, 1, cv2.LINE_AA)
     for pt in roi_pts:
         cv2.circle(out, tuple(pt), 4, roi_color, -1, cv2.LINE_AA)
     cv2.putText(out, "ROI",
-                (int(w * (ROI_TOP_LEFT + ROI_TOP_RIGHT) / 2) - 16,
-                 int(h * ROI_TOP_Y) - 8),
+                (int(w*(ROI_TOP_LEFT+ROI_TOP_RIGHT)/2)-16, int(h*ROI_TOP_Y)-8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, roi_color, 1, cv2.LINE_AA)
 
-    # ── Steering decision line ────────────────────────────────────────────────
     sl_y = int(h * STEERING_LINE_Y_FRAC)
     cx   = w // 2
 
     def _x_at_y(pts, target_y):
-        if not pts:
-            return None
-        for i in range(len(pts) - 1):
-            y_lo, y_hi = pts[i][1], pts[i + 1][1]
-            if min(y_lo, y_hi) <= target_y <= max(y_lo, y_hi):
-                if y_lo == y_hi:
-                    return pts[i][0]
-                t = (target_y - y_lo) / (y_hi - y_lo)
-                return int(pts[i][0] + t * (pts[i + 1][0] - pts[i][0]))
+        if not pts: return None
+        for i in range(len(pts)-1):
+            y_lo, y_hi = pts[i][1], pts[i+1][1]
+            if min(y_lo,y_hi) <= target_y <= max(y_lo,y_hi):
+                if y_lo == y_hi: return pts[i][0]
+                t = (target_y-y_lo)/(y_hi-y_lo)
+                return int(pts[i][0] + t*(pts[i+1][0]-pts[i][0]))
         return None
 
     lx_sl = _x_at_y(left_pts,  sl_y) if state.left_real  else None
     rx_sl = _x_at_y(right_pts, sl_y) if state.right_real else None
 
-    if lx_sl is not None and rx_sl is not None:
-        lane_cx = (lx_sl + rx_sl) // 2
-
-    elif lx_sl is not None and state.last_known_mid is not None:
-        dist    = state.last_known_mid - lx_sl
-        lane_cx = lx_sl + dist
-
-    elif rx_sl is not None and state.last_known_mid is not None:
-        dist    = rx_sl - state.last_known_mid
-        lane_cx = rx_sl - dist
-
-    elif lx_sl is not None:
-        lane_cx = lx_sl + int(ASSUMED_LANE_WIDTH_FRAC * w / 2)
-
-    elif rx_sl is not None:
-        lane_cx = rx_sl - int(ASSUMED_LANE_WIDTH_FRAC * w / 2)
-
-    elif state.last_known_mid is not None:
-        lane_cx = state.last_known_mid
-
-    else:
-        lane_cx = cx
+    if   lx_sl is not None and rx_sl is not None:          lane_cx = (lx_sl + rx_sl) // 2
+    elif lx_sl is not None and state.last_known_mid:        lane_cx = lx_sl + (state.last_known_mid - lx_sl)
+    elif rx_sl is not None and state.last_known_mid:        lane_cx = rx_sl - (rx_sl - state.last_known_mid)
+    elif lx_sl is not None:                                 lane_cx = lx_sl + int(ASSUMED_LANE_WIDTH_FRAC*w/2)
+    elif rx_sl is not None:                                 lane_cx = rx_sl - int(ASSUMED_LANE_WIDTH_FRAC*w/2)
+    elif state.last_known_mid is not None:                  lane_cx = state.last_known_mid
+    else:                                                   lane_cx = cx
 
     abs_angle = abs(steering_angle)
-    if abs_angle < TURN_THRESHOLD_DEG:
-        arrow_col  = (0, 220, 0);   turn_label = "STRAIGHT"
-    elif abs_angle < 25:
-        arrow_col  = (0, 200, 255); turn_label = "RIGHT" if steering_angle > 0 else "LEFT"
-    else:
-        arrow_col  = (0, 60, 230);  turn_label = "SHARP RIGHT" if steering_angle > 0 else "SHARP LEFT"
+    if   abs_angle < TURN_THRESHOLD_DEG: arrow_col = (0,220,0);   turn_label = "STRAIGHT"
+    elif abs_angle < 25:                 arrow_col = (0,200,255); turn_label = "RIGHT" if steering_angle>0 else "LEFT"
+    else:                                arrow_col = (0,60,230);  turn_label = "SHARP RIGHT" if steering_angle>0 else "SHARP LEFT"
 
-    # Guide line, centre tick, arrow, dot, label
-    cv2.line(out, (0, sl_y), (w, sl_y), (60, 60, 60), 1, cv2.LINE_AA)
-    cv2.line(out, (cx, sl_y - 18), (cx, sl_y + 18), (200, 200, 200), 2, cv2.LINE_AA)
-    cv2.arrowedLine(out, (cx, sl_y), (lane_cx, sl_y),
-                    arrow_col, 3, cv2.LINE_AA, tipLength=0.18)
-    cv2.circle(out, (lane_cx, sl_y), 7, arrow_col, -1, cv2.LINE_AA)
-    cv2.circle(out, (lane_cx, sl_y), 7, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.line(out, (0,sl_y), (w,sl_y), (60,60,60), 1, cv2.LINE_AA)
+    cv2.line(out, (cx,sl_y-18), (cx,sl_y+18), (200,200,200), 2, cv2.LINE_AA)
+    cv2.arrowedLine(out, (cx,sl_y), (lane_cx,sl_y), arrow_col, 3, cv2.LINE_AA, tipLength=0.18)
+    cv2.circle(out, (lane_cx,sl_y), 7, arrow_col, -1, cv2.LINE_AA)
+    cv2.circle(out, (lane_cx,sl_y), 7, (255,255,255), 1, cv2.LINE_AA)
     lbl_x = lane_cx + (12 if lane_cx >= cx else -12)
-    cv2.putText(out, turn_label, (lbl_x, sl_y - 12),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, arrow_col, 2, cv2.LINE_AA)
-    cv2.putText(out, f"offset {lane_cx - cx:+d}px",
-                (cx - 55, sl_y + 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(out, turn_label, (lbl_x, sl_y-12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, arrow_col, 2, cv2.LINE_AA)
+    cv2.putText(out, f"offset {lane_cx-cx:+d}px", (cx-55, sl_y+30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180,180,180), 1, cv2.LINE_AA)
     return out
 
 
@@ -774,35 +667,30 @@ def build_display(base_frame, boxes_frame, left_pts, right_pts,
                   traffic_state=DriveState.DRIVING, traffic_text="DRIVING"):
 
     display = boxes_frame.copy() if boxes_frame is not None else base_frame.copy()
-
     display = draw_lanes(display, left_pts, right_pts, lane_state, steering_angle)
 
     direction = "RIGHT" if steering_angle > 0 else "LEFT" if steering_angle < 0 else "STRAIGHT"
     cv2.putText(display, f"Steer: {steering_angle:.1f}deg ({direction})",
-                (10, 40), font, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
+                (10, 40), font, 1.0, (0,255,255), 2, cv2.LINE_AA)
 
     current_time = time.time()
     fps_window.append(1 / (current_time - prev_time))
-    avg_fps = sum(fps_window) / len(fps_window)
-    cv2.putText(display, f"FPS: {avg_fps:.1f}",
-                (10, 80), font, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(display, f"FPS: {sum(fps_window)/len(fps_window):.1f}",
+                (10, 80), font, 1.0, (0,255,0), 2, cv2.LINE_AA)
+    cv2.putText(display, f"L:{lane_state.left_conf:.2f}  R:{lane_state.right_conf:.2f}",
+                (10, 115), font, 0.6, (180,180,180), 1, cv2.LINE_AA)
 
-    cv2.putText(display,
-                f"L:{lane_state.left_conf:.2f}  R:{lane_state.right_conf:.2f}",
-                (10, 115), font, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
-
-    colour = _STATE_COLOURS.get(traffic_state, (200, 200, 200))
-    cv2.rectangle(display, (0, 130), (620, 162), (30, 30, 30), -1)
+    colour = _STATE_COLOURS.get(traffic_state, (200,200,200))
+    cv2.rectangle(display, (0,130), (620,162), (30,30,30), -1)
     cv2.putText(display, f"Traffic: {traffic_text}",
                 (10, 154), font, 0.9, colour, 2, cv2.LINE_AA)
 
     if not YOLO_ENABLED:
         bw, bh = 130, 28
         bx = display.shape[1] - bw - 10
-        cv2.rectangle(display, (bx, 10), (bx + bw, 10 + bh), (0, 0, 200), -1)
-        cv2.rectangle(display, (bx, 10), (bx + bw, 10 + bh), (0, 0, 100),  1)
-        cv2.putText(display, "YOLO OFF", (bx + 14, 10 + 20),
-                    font, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(display, (bx,10), (bx+bw, 10+bh), (0,0,200), -1)
+        cv2.rectangle(display, (bx,10), (bx+bw, 10+bh), (0,0,100),  1)
+        cv2.putText(display, "YOLO OFF", (bx+14, 10+20), font, 0.65, (255,255,255), 2, cv2.LINE_AA)
 
     return display, direction, current_time
 
@@ -821,6 +709,18 @@ def make_kart():
     return kart
 
 
+def startup_kart(kart):
+    """Send the required startup sequence: release brake then start motor."""
+    if not kart:
+        return
+    print("[KART] Releasing brake...")
+    kart.release()
+    time.sleep(0.8)   # give the actuator time to travel
+    print("[KART] Starting motor...")
+    kart.start()
+    print("[KART] Ready.")
+
+
 # ──────────────────────────────────────────────
 # CAMERA MODE
 # ──────────────────────────────────────────────
@@ -830,7 +730,7 @@ def run_on_camera(source=1):
     frame_count = 0
 
     kart = make_kart()
-    if kart: kart.release()
+    startup_kart(kart)
 
     capture  = FrameCapture(source=source, max_retries=5)
     lane_det = LaneDetector()
@@ -845,8 +745,7 @@ def run_on_camera(source=1):
     master.title("Steering (experimental)")
     master.configure(bg="#111")
     master.resizable(False, False)
-    wheel_canvas = Canvas(master, width=300, height=330, bg="#111",
-                          highlightthickness=0)
+    wheel_canvas = Canvas(master, width=300, height=330, bg="#111", highlightthickness=0)
     wheel_canvas.pack(padx=20, pady=20)
 
     cv2.namedWindow("SDC View [EXP]", cv2.WINDOW_NORMAL)
@@ -891,7 +790,8 @@ def run_on_camera(source=1):
         if key == ord('q'):
             break
         elif key == ord('e'):
-            if kart: kart.estop(); print("ESTOP!")
+            if kart: kart.estop()
+            print("ESTOP!")
         elif key == ord('o'):
             YOLO_ENABLED = not YOLO_ENABLED
             print(f"[YOLO] {'ON' if YOLO_ENABLED else 'OFF'}")
@@ -913,7 +813,7 @@ def run_on_video(path):
     frame_count = 0
 
     kart = make_kart()
-    if kart: kart.release()
+    startup_kart(kart)
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
@@ -936,8 +836,7 @@ def run_on_video(path):
     master.title("Steering (experimental)")
     master.configure(bg="#111")
     master.resizable(False, False)
-    wheel_canvas = Canvas(master, width=300, height=330, bg="#111",
-                          highlightthickness=0)
+    wheel_canvas = Canvas(master, width=300, height=330, bg="#111", highlightthickness=0)
     wheel_canvas.pack(padx=20, pady=20)
 
     cv2.namedWindow("SDC View [EXP]", cv2.WINDOW_NORMAL)
@@ -971,8 +870,7 @@ def run_on_video(path):
 
             bar_w = int(display.shape[1] * frame_count / max(total, 1))
             cv2.rectangle(display,
-                          (0, display.shape[0] - 6),
-                          (bar_w, display.shape[0]),
+                          (0, display.shape[0]-6), (bar_w, display.shape[0]),
                           (0, 200, 255), -1)
 
             draw_steering_wheel(wheel_canvas, steering_angle)
@@ -994,7 +892,8 @@ def run_on_video(path):
             paused = not paused
             print("Paused." if paused else "Resumed.")
         elif key == ord('e'):
-            if kart: kart.estop(); print("ESTOP!")
+            if kart: kart.estop()
+            print("ESTOP!")
         elif key == ord('o'):
             YOLO_ENABLED = not YOLO_ENABLED
             print(f"[YOLO] {'ON' if YOLO_ENABLED else 'OFF'}")

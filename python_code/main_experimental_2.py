@@ -1,8 +1,9 @@
 """
-main_experimental.py — SDC with traffic-sign brake control + improved lane detection.
+main_experimental.py — SDC with traffic-sign brake control + stop-line detection
+                        + improved lane detection + intersection navigation.
 
-Stop sign  → full brake, hold 10 s, then resume.
-Red light  → full brake, hold until green light detected, then resume.
+Stop sign  → slow to approach speed, brake AT the stop line, hold 10 s, resume.
+Red light  → slow to approach speed, brake AT the stop line, wait for green, resume.
 
 Keys:
   q  — quit
@@ -31,33 +32,23 @@ KART_PORT    = "/dev/ttyUSB0"
 KART_ENABLED = True
 
 # ── YOLO ──────────────────────────────────────────────────────────────────────
-YOLO_ENABLED = True   # toggle with 'o' key at runtime
 
-model = YOLO('object_models/best.pt') if YOLO_ENABLED else None
+model = YOLO('object_models/best.pt')
 
+YOLO_ENABLED = False   # toggle with 'o' key at runtime
 
 # ── Steering settings ─────────────────────────────────────────────────────────
 
 STEERING_ANGLE_LIMIT = 90.0
 
 # ── ROI trapezoid (fractions of frame size) ───────────────────────────────────
-# Trapezoid is better than rectangle: cuts the far-left opposite-carriageway
-# line while still capturing both lane lines at distance.
-#
-#   Top edge (narrow): spans 20%–80% of width at 45% height
-#   Bottom edge (wider): spans 5%–95% of width at 95% height
-#
-# Tweak ROI_TOP_LEFT / ROI_TOP_RIGHT first if one lane is still missed.
 
-ROI_TOP_Y     = 0.5
+ROI_TOP_Y     = 0.3
 ROI_BOTTOM_Y  = 0.95
-ROI_TOP_LEFT  = 0.10
-ROI_TOP_RIGHT = 0.90
-ROI_BOT_LEFT  = 0.0
-ROI_BOT_RIGHT = 1.0
-
-# How far the top edge shifts per degree of steering (fraction of width)
-ROI_STEER_SHIFT = 0.002
+ROI_TOP_LEFT  = 0.20
+ROI_TOP_RIGHT = 0.80
+ROI_BOT_LEFT  = 0
+ROI_BOT_RIGHT = 1
 
 # ── Lane detection tuning ─────────────────────────────────────────────────────
 
@@ -65,27 +56,35 @@ POLY_DEGREE            = 2
 ALPHA_FRESH            = 0.35
 ALPHA_MEDIUM           = 0.15
 ALPHA_STALE            = 0.04
-MIN_VERTICAL_SPAN_FRAC = 0.08   # shorter ROI → lines span less vertically
+MIN_VERTICAL_SPAN_FRAC = 0.15
 ASSUMED_LANE_WIDTH_FRAC= 0.6
 MAX_HISTORY            = 7
 N_POLY_POINTS          = 20
-HOUGH_THRESHOLD        = 20    # lower: fewer edge pixels in a smaller ROI
-HOUGH_MIN_LEN          = 30    # shorter: lines are shorter in a smaller ROI
-HOUGH_MAX_GAP          = 80
+HOUGH_THRESHOLD        = 30
+HOUGH_MIN_LEN          = 60
+HOUGH_MAX_GAP          = 120
 HOUGH_MIN_SLOPE        = 0.40
 
 # ── Dot / road-stud filter ────────────────────────────────────────────────────
-# White blobs smaller than this pixel area are removed from the colour mask
-# before edge detection. Cat's-eyes / road studs are ~10-40 px² at typical
-# driving distance; a real lane-line stripe is hundreds of px².
-DOT_MIN_AREA = 5000   # blobs below this area are considered noise and dropped
 
-# X-zone: each lane candidate must physically be on the correct side.
-# Left candidates:  midpoint x < LEFT_X_MAX   (fraction of width)
-# Right candidates: midpoint x > RIGHT_X_MIN  (fraction of width)
-# Widened to 0.60 / 0.40 so a line that crosses centre slightly still qualifies.
+DOT_MIN_AREA = 5000
+
+# ── X-zone lane side thresholds ──────────────────────────────────────────────
+
 LEFT_X_MAX_FRAC  = 0.60
 RIGHT_X_MIN_FRAC = 0.40
+
+# ── Stop line detection ───────────────────────────────────────────────────────
+# A painted stop / give-way line is a wide, near-horizontal stripe in the lower
+# portion of the frame.  All three conditions must pass simultaneously.
+
+STOP_LINE_MIN_SPAN   = 0.40   # must span at least 40% of frame width
+STOP_LINE_MAX_SLOPE  = 0.20   # near-horizontal: |dy/dx| < this value
+STOP_LINE_MIN_Y_FRAC = 0.55   # must be in the lower 45% of the frame (close)
+
+# ── Intersection detection (heuristic, no extra training needed) ──────────────
+
+INTERSECTION_LINE_BURST = 12   # raw Hough count above this = line explosion
 
 # ── Steering display ──────────────────────────────────────────────────────────
 
@@ -100,6 +99,8 @@ GREEN_LABELS         = {"green"}
 STOP_HOLD_DURATION   = 10.0
 BRAKE_RAMP_DURATION  = 1.0
 DETECTION_CONFIDENCE = 0.5
+APPROACH_SPEED       = 0.35   # fraction of full speed while creeping to stop line
+APPROACH_TIMEOUT     = 4.0    # seconds — brake hard even if no line found in time
 
 # ── Misc ──────────────────────────────────────────────────────────────────────
 
@@ -107,32 +108,51 @@ PRINT_EVERY = 10
 frame_count  = 0
 
 
-# ──────────────────────────────────────────────
-# LANE STATE
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA CLASSES
+# ══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class LaneState:
-    left_poly:    Optional[np.ndarray] = None
-    right_poly:   Optional[np.ndarray] = None
-    left_conf:    float = 0.0
-    right_conf:   float = 0.0
-    error_hist:   List[float] = field(default_factory=list)
-    # True = actually detected this frame; False = estimated from the other side
-    left_real:    bool = False
-    right_real:   bool = False
+    left_poly:      Optional[np.ndarray] = None
+    right_poly:     Optional[np.ndarray] = None
+    left_conf:      float = 0.0
+    right_conf:     float = 0.0
+    error_hist:     List[float] = field(default_factory=list)
+    left_real:      bool = False   # True = detected this frame, False = estimated
+    right_real:     bool = False
+    last_known_mid: Optional[int] = None
 
 
-# ──────────────────────────────────────────────
+@dataclass
+class IntersectionSignals:
+    """Four independent heuristic signals.  Two or more = intersection confirmed."""
+    horizontal_line: bool = False
+    conf_collapse:   bool = False
+    line_burst:      bool = False
+    width_anomaly:   bool = False
+
+    @property
+    def score(self) -> int:
+        return sum([self.horizontal_line, self.conf_collapse,
+                    self.line_burst,      self.width_anomaly])
+
+    @property
+    def detected(self) -> bool:
+        return self.score >= 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRAFFIC STATE MACHINE
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 class DriveState(Enum):
-    DRIVING      = "DRIVING"
-    BRAKING      = "BRAKING"
-    STOPPED_SIGN = "STOPPED (stop sign)"
-    STOPPED_RED  = "STOPPED (red light)"
-    RESUMING     = "RESUMING"
+    DRIVING          = "DRIVING"
+    APPROACHING_LINE = "APPROACHING LINE"   # sign/light seen — slow & watch for line
+    BRAKING          = "BRAKING"
+    STOPPED_SIGN     = "STOPPED (stop sign)"
+    STOPPED_RED      = "STOPPED (red light)"
+    RESUMING         = "RESUMING"
 
 
 class TrafficStateController:
@@ -140,6 +160,8 @@ class TrafficStateController:
         self.state        = DriveState.DRIVING
         self.state_start  = time.time()
         self._brake_cause = None
+
+    # ── helpers ───────────────────────────────────────────────────────────────
 
     def _best_match(self, detections, label_set):
         matches = [d for d in detections
@@ -152,63 +174,107 @@ class TrafficStateController:
         print(f"[TRAFFIC] {self.state.value} → {new_state.value}{tag}")
         self.state       = new_state
         self.state_start = time.time()
-        if new_state == DriveState.BRAKING:
-            if kart: kart.brake(1.0)
-        elif new_state in (DriveState.STOPPED_SIGN, DriveState.STOPPED_RED):
-            if kart: kart.brake(1.0)
-        elif new_state == DriveState.RESUMING:
-            if kart: kart.release()
 
-    def update(self, detections, kart):
+        if new_state == DriveState.APPROACHING_LINE:
+            # Slow down but do NOT brake yet
+            if kart:
+                kart.set_speed(APPROACH_SPEED)
+
+        elif new_state == DriveState.BRAKING:
+            if kart:
+                kart.brake(1.0)
+
+        elif new_state in (DriveState.STOPPED_SIGN, DriveState.STOPPED_RED):
+            if kart:
+                kart.brake(1.0)
+
+        elif new_state == DriveState.RESUMING:
+            if kart:
+                kart.release()
+
+    # ── main update ───────────────────────────────────────────────────────────
+
+    def update(self, detections, kart, stop_line_detected: bool = False):
+        """
+        Call once per frame.
+
+        stop_line_detected  — True when _detect_stop_line() fires AND we are
+                              currently in APPROACHING_LINE state.  The caller
+                              should gate this flag accordingly.
+
+        Returns: (brake_active, state_label, status_text)
+        """
         now     = time.time()
         elapsed = now - self.state_start
         stop_det  = self._best_match(detections, STOP_LABELS)
         red_det   = self._best_match(detections, RED_LABELS)
         green_det = self._best_match(detections, GREEN_LABELS)
 
+        # ── state transitions ─────────────────────────────────────────────────
+
         if self.state == DriveState.DRIVING:
             if stop_det:
                 self._brake_cause = "sign"
-                self._transition(DriveState.BRAKING, kart,
+                self._transition(DriveState.APPROACHING_LINE, kart,
                                  reason=f"stop sign {stop_det['confidence']:.2f}")
             elif red_det:
                 self._brake_cause = "red"
-                self._transition(DriveState.BRAKING, kart,
+                self._transition(DriveState.APPROACHING_LINE, kart,
                                  reason=f"red light {red_det['confidence']:.2f}")
+
+        elif self.state == DriveState.APPROACHING_LINE:
+            # Brake when we actually reach the painted line — or time out.
+            if stop_line_detected:
+                self._transition(DriveState.BRAKING, kart, reason="stop line reached")
+            elif elapsed >= APPROACH_TIMEOUT:
+                self._transition(DriveState.BRAKING, kart, reason="approach timeout")
+
         elif self.state == DriveState.BRAKING:
             if elapsed >= BRAKE_RAMP_DURATION:
                 if self._brake_cause == "sign":
                     self._transition(DriveState.STOPPED_SIGN, kart)
                 else:
                     self._transition(DriveState.STOPPED_RED, kart)
+
         elif self.state == DriveState.STOPPED_SIGN:
             if elapsed >= STOP_HOLD_DURATION:
                 self._transition(DriveState.RESUMING, kart, reason="10 s elapsed")
+
         elif self.state == DriveState.STOPPED_RED:
             if green_det:
                 self._transition(DriveState.RESUMING, kart,
                                  reason=f"green light {green_det['confidence']:.2f}")
+
         elif self.state == DriveState.RESUMING:
             if elapsed >= 0.5:
                 self._transition(DriveState.DRIVING, kart)
 
+        # ── outputs ───────────────────────────────────────────────────────────
+
         brake_active = self.state in (
-            DriveState.BRAKING, DriveState.STOPPED_SIGN, DriveState.STOPPED_RED)
+            DriveState.BRAKING,
+            DriveState.STOPPED_SIGN,
+            DriveState.STOPPED_RED,
+        )
         return brake_active, self.state.value, self._status_text(elapsed)
 
     def _status_text(self, elapsed):
+        if self.state == DriveState.APPROACHING_LINE:
+            return "APPROACHING — watching for stop line"
         if self.state == DriveState.STOPPED_SIGN:
             return f"STOP SIGN — resuming in {max(0.0, STOP_HOLD_DURATION - elapsed):.1f}s"
         if self.state == DriveState.STOPPED_RED:
             return f"RED LIGHT — waiting {elapsed:.0f}s (need green)"
-        if self.state == DriveState.BRAKING:  return "BRAKING"
-        if self.state == DriveState.RESUMING: return "RESUMING"
+        if self.state == DriveState.BRAKING:
+            return "BRAKING"
+        if self.state == DriveState.RESUMING:
+            return "RESUMING"
         return "DRIVING"
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # FRAME CAPTURE THREAD
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 class FrameCapture:
     def __init__(self, source=0, max_retries=5):
@@ -266,44 +332,30 @@ class FrameCapture:
         self.cap.release()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # LANE DETECTION — helpers
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _roi_points(shape, steering_angle: float = 0.0):
-    """Return the four trapezoid corners, shifted laterally by steering angle."""
-    h, w = shape
-    shift = float(np.clip(steering_angle * ROI_STEER_SHIFT, -0.15, 0.15))
-    tl = float(np.clip(ROI_TOP_LEFT  + shift, 0.0, 0.49))
-    tr = float(np.clip(ROI_TOP_RIGHT + shift, 0.51, 1.0))
-    return np.array([[
-        (int(w * ROI_BOT_LEFT),  int(h * ROI_BOTTOM_Y)),
-        (int(w * tl),            int(h * ROI_TOP_Y)),
-        (int(w * tr),            int(h * ROI_TOP_Y)),
-        (int(w * ROI_BOT_RIGHT), int(h * ROI_BOTTOM_Y)),
-    ]], dtype=np.int32), tl, tr
-
-
-def _roi_mask(shape, steering_angle: float = 0.0):
-    """Trapezoid ROI mask, adaptive to current steering angle."""
+def _roi_mask(shape):
+    """Trapezoid ROI — narrow at top (horizon), wide at bottom (near kart)."""
     h, w = shape
     mask = np.zeros((h, w), dtype=np.uint8)
-    pts, _, _ = _roi_points(shape, steering_angle)
+    pts  = np.array([[
+        (int(w * ROI_BOT_LEFT),  int(h * ROI_BOTTOM_Y)),
+        (int(w * ROI_TOP_LEFT),  int(h * ROI_TOP_Y)),
+        (int(w * ROI_TOP_RIGHT), int(h * ROI_TOP_Y)),
+        (int(w * ROI_BOT_RIGHT), int(h * ROI_BOTTOM_Y)),
+    ]], dtype=np.int32)
     cv2.fillPoly(mask, pts, 255)
     return mask
 
 
 def _remove_small_blobs(mask, min_area=DOT_MIN_AREA):
-    """
-    Remove connected white regions smaller than min_area pixels.
-    Kills road studs / cat's-eyes which are small circular blobs,
-    while leaving lane-line stripes (large elongated regions) intact.
-    """
-    # Label every connected white region
+    """Remove connected white regions smaller than min_area pixels (road studs)."""
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         mask, connectivity=8)
     clean = np.zeros_like(mask)
-    for lbl in range(1, num_labels):          # label 0 is background
+    for lbl in range(1, num_labels):
         if stats[lbl, cv2.CC_STAT_AREA] >= min_area:
             clean[labels == lbl] = 255
     return clean
@@ -311,60 +363,33 @@ def _remove_small_blobs(mask, min_area=DOT_MIN_AREA):
 
 def _edge_image(frame):
     """
-    Produce an edge image that highlights white and yellow lane markings
-    while suppressing road studs / cat's-eyes (small white dots).
+    Edge image highlighting white/yellow lane markings, suppressing road studs.
 
     Pipeline:
-      1. HLS colour mask for white and yellow markings.
-      2. Morphological opening (erode then dilate) on the white mask —
-         this removes blobs that are thinner than the structuring element,
-         i.e. dots, while keeping wider stripes.
-      3. Connected-component area filter — any remaining blob smaller than
-         DOT_MIN_AREA pixels is dropped entirely.
+      1. HLS colour mask for white and yellow.
+      2. Morphological opening on white mask — kills narrow dots.
+      3. Connected-component area filter — drops remaining small blobs.
       4. CLAHE + Gaussian blur + Canny on the L channel.
-      5. AND the edge image with the cleaned colour mask.
+      5. AND edges with colour mask.
     """
     hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
 
-    # White: broad lightness range — catches faded/shaded markings
     white  = cv2.inRange(hls, np.array([0,   130,   0]),
                               np.array([255, 255,  60]))
-    # Yellow: standard road-marking hue
     yellow = cv2.inRange(hls, np.array([15,   80,  80]),
                               np.array([35,  255, 255]))
 
-    # ── Step 2: morphological open on white mask ──────────────────────────
-    # A 7×7 ellipse erodes away blobs narrower than ~7 px in any direction
-    # (road studs), then dilates back to restore wider stripe edges.
-    dot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    white_clean = cv2.morphologyEx(white, cv2.MORPH_OPEN, dot_kernel,
-                                   iterations=1)
-
-    # ── Step 3: connected-component area filter ───────────────────────────
+    dot_kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    white_clean = cv2.morphologyEx(white, cv2.MORPH_OPEN, dot_kernel, iterations=1)
     white_clean = _remove_small_blobs(white_clean, DOT_MIN_AREA)
+    color_mask  = cv2.bitwise_or(white_clean, yellow)
 
-    color_mask = cv2.bitwise_or(white_clean, yellow)
-
-    # ── Steps 4 & 5: edges on CLAHE-enhanced L channel ───────────────────
     l, a, b = cv2.split(cv2.cvtColor(frame, cv2.COLOR_BGR2LAB))
     cl      = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(l)
     blur    = cv2.GaussianBlur(cl, (7, 7), 0)
     edges   = cv2.Canny(blur, 50, 150)
 
     return cv2.bitwise_and(edges, color_mask)
-
-
-def _lane_mask(frame):
-    """Return the raw white+yellow color mask — shows the full lane fill with no edge postprocessing."""
-    hls = cv2.cvtColor(frame, cv2.COLOR_BGR2HLS)
-    white  = cv2.inRange(hls, np.array([0,   130,   0]),
-                              np.array([255, 255,  60]))
-    yellow = cv2.inRange(hls, np.array([15,   80,  80]),
-                              np.array([35,  255, 255]))
-    dot_kernel  = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-    white_clean = cv2.morphologyEx(white, cv2.MORPH_OPEN, dot_kernel, iterations=1)
-    white_clean = _remove_small_blobs(white_clean, DOT_MIN_AREA)
-    return cv2.bitwise_or(white_clean, yellow)
 
 
 def _fit_poly(pts_x, pts_y, h):
@@ -401,27 +426,140 @@ def _smooth_poly(current, previous, conf):
     return blended, alpha * conf + (1 - alpha) * 1.0
 
 
+# ── Stop line detection ───────────────────────────────────────────────────────
+
+def _detect_stop_line(lines, frame_shape) -> bool:
+    """
+    Returns True when a wide, near-horizontal painted line appears in the lower
+    portion of the frame — the stop / give-way line at an intersection.
+
+    Operates on the RAW HoughLinesP output before the lane-line slope filter
+    discards horizontal segments.
+
+    Tune:
+      STOP_LINE_MIN_SPAN    raise to reduce false positives (shadows, crossings)
+      STOP_LINE_MAX_SLOPE   lower to require a more horizontal line
+      STOP_LINE_MIN_Y_FRAC  raise to require the line to be closer to the kart
+    """
+    if lines is None:
+        return False
+    h, w   = frame_shape[:2]
+    min_y  = h * STOP_LINE_MIN_Y_FRAC
+    for ln in lines:
+        x1, y1, x2, y2 = ln[0]
+        if min(y1, y2) < min_y:
+            continue                          # line is too far away
+        if x2 == x1:
+            continue
+        slope = abs((y2 - y1) / (x2 - x1))
+        span  = abs(x2 - x1) / w
+        if slope < STOP_LINE_MAX_SLOPE and span > STOP_LINE_MIN_SPAN:
+            return True
+    return False
+
+
+# ── Intersection heuristics ───────────────────────────────────────────────────
+
+def _detect_horizontal_lines(lines, w) -> bool:
+    """Wide, near-horizontal Hough lines = likely cross-road marking."""
+    if lines is None:
+        return False
+    for ln in lines:
+        x1, y1, x2, y2 = ln[0]
+        if x2 == x1:
+            continue
+        slope = abs((y2 - y1) / (x2 - x1))
+        span  = abs(x2 - x1) / w
+        if slope < 0.25 and span > 0.30:
+            return True
+    return False
+
+
+def _lanes_collapsing(state: LaneState) -> bool:
+    """Both lane confidences low while history shows a previously stable lane."""
+    both_weak = state.left_conf < 0.35 and state.right_conf < 0.35
+    had_lane  = len(state.error_hist) >= 3
+    return both_weak and had_lane
+
+
+def _lane_width_anomaly(left_pts, right_pts, w,
+                        expected_frac=ASSUMED_LANE_WIDTH_FRAC,
+                        tolerance=0.25) -> bool:
+    """Apparent lane width jumps when cross-road geometry enters the ROI."""
+    if not left_pts or not right_pts:
+        return False
+    actual = abs(right_pts[0][0] - left_pts[0][0]) / w
+    return abs(actual - expected_frac) > tolerance
+
+
+def _build_intersection_signals(lines, left_pts, right_pts,
+                                 state: LaneState, w) -> IntersectionSignals:
+    line_count = len(lines) if lines is not None else 0
+    return IntersectionSignals(
+        horizontal_line = _detect_horizontal_lines(lines, w),
+        conf_collapse   = _lanes_collapsing(state),
+        line_burst      = line_count >= INTERSECTION_LINE_BURST,
+        width_anomaly   = _lane_width_anomaly(left_pts, right_pts, w),
+    )
+
+
+# ── Persistence filter for intersection detection ─────────────────────────────
+
+class IntersectionDetector:
+    """
+    Requires N consecutive frames with 2+ heuristic signals before confirming.
+    After confirmation, suppresses re-detection for cooldown_frames frames so
+    the kart doesn't re-trigger mid-turn.
+    """
+    def __init__(self, confirm_frames=4, cooldown_frames=60):
+        self._buffer         = deque(maxlen=confirm_frames)
+        self._cooldown       = 0
+        self.confirm_frames  = confirm_frames
+        self.cooldown_frames = cooldown_frames
+
+    def update(self, signals: IntersectionSignals) -> bool:
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            return False
+        self._buffer.append(signals.detected)
+        confirmed = sum(self._buffer) >= self.confirm_frames
+        if confirmed:
+            self._buffer.clear()
+            self._cooldown = self.cooldown_frames
+            return True
+        return False
+
+
+# ── Core lane detection ───────────────────────────────────────────────────────
+
 def _detect_lines_worker(frame, state: LaneState):
+    """
+    Returns:
+        left_pts           — list of (x,y) points for the left lane line (or None)
+        right_pts          — list of (x,y) points for the right lane line (or None)
+        state              — updated LaneState
+        stop_line_detected — bool: wide horizontal line in lower frame
+        intersection_sigs  — IntersectionSignals dataclass
+    """
     h, w    = frame.shape[:2]
     y_top   = int(h * ROI_TOP_Y)
-    y_bot     = int(h * ROI_BOTTOM_Y)
-    cur_angle = (state.error_hist[-1] * STEERING_ANGLE_LIMIT
-                 if state.error_hist else 0.0)
-    roi       = _roi_mask((h, w), steering_angle=cur_angle)
-    # Black out everything outside the ROI before any processing
-    roi_frame = cv2.bitwise_and(frame, frame, mask=roi)
-    edges     = _edge_image(roi_frame)
-    cropped   = edges  # already ROI-limited
+    y_bot   = int(h * ROI_BOTTOM_Y)
+    edges   = _edge_image(frame)
+    mask    = _roi_mask((h, w))
+    cropped = cv2.bitwise_and(edges, mask)
 
     lines = cv2.HoughLinesP(cropped, 1, np.pi / 180,
                             threshold=HOUGH_THRESHOLD,
                             minLineLength=HOUGH_MIN_LEN,
                             maxLineGap=HOUGH_MAX_GAP)
 
+    # ── Stop line — check raw lines BEFORE slope filter ──────────────────────
+    stop_line_detected = _detect_stop_line(lines, frame.shape)
+
+    # ── Lane line extraction ──────────────────────────────────────────────────
     left_xs, left_ys, right_xs, right_ys = [], [], [], []
-    cx           = w / 2
-    left_x_max   = w * LEFT_X_MAX_FRAC   # left candidates must be left of this
-    right_x_min  = w * RIGHT_X_MIN_FRAC  # right candidates must be right of this
+    left_x_max  = w * LEFT_X_MAX_FRAC
+    right_x_min = w * RIGHT_X_MIN_FRAC
 
     if lines is not None:
         for ln in lines:
@@ -432,44 +570,63 @@ def _detect_lines_worker(frame, state: LaneState):
             if abs(slope) < HOUGH_MIN_SLOPE:
                 continue
             mid_x = (x1 + x2) / 2
-
-            # Left lane: negative slope (converges toward vanishing point on left)
-            # AND midpoint is in the left portion of the frame
             if slope < 0 and mid_x < left_x_max:
-                left_xs  += [x1, x2]
-                left_ys  += [y1, y2]
-
-            # Right lane: positive slope AND midpoint in the right portion
+                left_xs  += [x1, x2];  left_ys  += [y1, y2]
             elif slope > 0 and mid_x > right_x_min:
-                right_xs += [x1, x2]
-                right_ys += [y1, y2]
+                right_xs += [x1, x2];  right_ys += [y1, y2]
 
     new_left,  lc = _fit_poly(left_xs,  left_ys,  h)
     new_right, rc = _fit_poly(right_xs, right_ys, h)
     state.left_poly,  state.left_conf  = _smooth_poly(new_left,  state.left_poly,  lc)
     state.right_poly, state.right_conf = _smooth_poly(new_right, state.right_poly, rc)
-
-    # Track which lines were genuinely detected vs estimated
     state.left_real  = new_left  is not None
     state.right_real = new_right is not None
 
-    left_pts  = _sample_poly(state.left_poly,  y_top, y_bot) if state.left_real  else None
-    right_pts = _sample_poly(state.right_poly, y_top, y_bot) if state.right_real else None
+    left_pts  = _sample_poly(state.left_poly,  y_top, y_bot) if state.left_poly  is not None else None
+    right_pts = _sample_poly(state.right_poly, y_top, y_bot) if state.right_poly is not None else None
 
-    return left_pts, right_pts, state
+    # Estimated (visual only) missing lane line
+    lane_w = int(ASSUMED_LANE_WIDTH_FRAC * w)
+    if left_pts is not None and right_pts is None:
+        right_pts = [(x + lane_w, y) for x, y in left_pts]
+    elif right_pts is not None and left_pts is None:
+        left_pts  = [(x - lane_w, y) for x, y in right_pts]
+
+    # ── Intersection heuristics ───────────────────────────────────────────────
+    intersection_sigs = _build_intersection_signals(lines, left_pts, right_pts, state, w)
+
+    return left_pts, right_pts, state, stop_line_detected, intersection_sigs
 
 
 def _compute_steering(frame_width, left_pts, right_pts, state: LaneState):
     cx = frame_width // 2
-
     lx = left_pts[0][0]  if left_pts  else None
     rx = right_pts[0][0] if right_pts else None
 
-    if lx is None or rx is None:
-        state.error_hist.clear()
-        return 0.0
-
-    lane_center = (lx + rx) // 2
+    if state.left_real and state.right_real:
+        lane_center          = (lx + rx) // 2
+        state.last_known_mid = lane_center
+    elif state.left_real and state.last_known_mid is not None:
+        dist        = state.last_known_mid - lx
+        lane_center = lx + dist
+    elif state.right_real and state.last_known_mid is not None:
+        dist        = rx - state.last_known_mid
+        lane_center = rx - dist
+    elif state.left_real:
+        lane_center = lx + int(ASSUMED_LANE_WIDTH_FRAC * frame_width / 2)
+    elif state.right_real:
+        lane_center = rx - int(ASSUMED_LANE_WIDTH_FRAC * frame_width / 2)
+    else:
+        if state.last_known_mid is not None:
+            lane_center = state.last_known_mid
+        else:
+            last = state.error_hist[-1] if state.error_hist else 0.0
+            state.error_hist.append(last)
+            if len(state.error_hist) > MAX_HISTORY:
+                state.error_hist.pop(0)
+            smoothed = np.mean(state.error_hist)
+            return float(np.clip(smoothed * STEERING_ANGLE_LIMIT,
+                                 -STEERING_ANGLE_LIMIT, STEERING_ANGLE_LIMIT))
 
     error      = lane_center - cx
     normalized = float(np.clip(error / (frame_width * 0.30), -1.0, 1.0))
@@ -483,21 +640,23 @@ def _compute_steering(frame_width, left_pts, right_pts, state: LaneState):
                          -STEERING_ANGLE_LIMIT, STEERING_ANGLE_LIMIT))
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # LANE DETECTION THREAD
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 class LaneDetector:
     def __init__(self):
-        self.input_frame    = None
-        self.left_pts       = None
-        self.right_pts      = None
-        self.steering_angle = 0.0
-        self._lane_state    = LaneState()
-        self.input_lock     = threading.Lock()
-        self.output_lock    = threading.Lock()
-        self.stopped        = False
-        self.thread         = threading.Thread(target=self._run, daemon=True)
+        self.input_frame       = None
+        self.left_pts          = None
+        self.right_pts         = None
+        self.steering_angle    = 0.0
+        self.stop_line         = False
+        self.intersection_sigs = IntersectionSignals()
+        self._lane_state       = LaneState()
+        self.input_lock        = threading.Lock()
+        self.output_lock       = threading.Lock()
+        self.stopped           = False
+        self.thread            = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def submit(self, frame):
@@ -507,32 +666,38 @@ class LaneDetector:
     def _run(self):
         while not self.stopped:
             with self.input_lock:
-                frame = self.input_frame
+                frame            = self.input_frame
                 self.input_frame = None
             if frame is None:
                 time.sleep(0.001)
                 continue
-            left_pts, right_pts, self._lane_state = _detect_lines_worker(
-                frame, self._lane_state)
+
+            left_pts, right_pts, self._lane_state, stop_line, isect_sigs = \
+                _detect_lines_worker(frame, self._lane_state)
+
             angle = _compute_steering(frame.shape[1], left_pts, right_pts,
                                       self._lane_state)
+
             with self.output_lock:
-                self.left_pts       = left_pts
-                self.right_pts      = right_pts
-                self.steering_angle = angle
+                self.left_pts          = left_pts
+                self.right_pts         = right_pts
+                self.steering_angle    = angle
+                self.stop_line         = stop_line
+                self.intersection_sigs = isect_sigs
 
     def read(self):
         with self.output_lock:
-            return self.left_pts, self.right_pts, self.steering_angle, self._lane_state
+            return (self.left_pts, self.right_pts, self.steering_angle,
+                    self._lane_state, self.stop_line, self.intersection_sigs)
 
     def release(self):
         self.stopped = True
         self.thread.join(timeout=3)
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # YOLO DETECTION THREAD
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 class YoloDetector:
     def __init__(self):
@@ -552,19 +717,17 @@ class YoloDetector:
     def _run(self):
         while not self.stopped:
             with self.input_lock:
-                frame = self.input_frame
+                frame            = self.input_frame
                 self.input_frame = None
             if frame is None:
                 time.sleep(0.001)
                 continue
 
-            # ── YOLO toggle ───────────────────────────────────────────────────
             if not YOLO_ENABLED:
                 with self.output_lock:
                     self.detections  = []
                     self.boxes_frame = None
                 continue
-            # ─────────────────────────────────────────────────────────────────
 
             results     = model.predict(source=frame, conf=0.5, stream=False,
                                         half=True, verbose=False)
@@ -591,9 +754,9 @@ class YoloDetector:
         self.thread.join(timeout=3)
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # STEERING WHEEL WIDGET
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def draw_steering_wheel(canvas, angle, width=300, height=300):
     canvas.delete("all")
@@ -620,12 +783,14 @@ def draw_steering_wheel(canvas, angle, width=300, height=300):
                        fill="white", font=("Arial", 13, "bold"))
 
 
-# ──────────────────────────────────────────────
-# DRAW LANES  (ROI outline + steering line)
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# DRAW LANES
+# ══════════════════════════════════════════════════════════════════════════════
 
 def draw_lanes(frame, left_pts, right_pts, state: LaneState,
-               steering_angle: float = 0.0):
+               steering_angle: float = 0.0,
+               stop_line_active: bool = False,
+               intersection_sigs: Optional[IntersectionSignals] = None):
     h, w    = frame.shape[:2]
     out     = frame.copy()
     overlay = np.zeros_like(out)
@@ -634,17 +799,14 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
         for i in range(len(pts) - 1):
             cv2.line(overlay, pts[i], pts[i + 1], color, thickness, cv2.LINE_AA)
 
-    # Filled lane polygon
     if left_pts and right_pts:
         poly = np.array(left_pts + right_pts[::-1], dtype=np.int32)
         cv2.fillPoly(overlay, [poly], (0, 80, 0))
 
-    # Lane lines: bright green = real detection, blue-grey dashed = estimated
     if left_pts:
         if state.left_real:
             draw_polyline(left_pts, (0, 220, 0), thickness=6)
         else:
-            # Draw dashed to make it obvious this is a guess
             for i in range(0, len(left_pts) - 1, 2):
                 cv2.line(overlay, left_pts[i], left_pts[i + 1],
                          (120, 120, 80), 4, cv2.LINE_AA)
@@ -658,9 +820,13 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
 
     out = cv2.addWeighted(out, 1.0, overlay, 0.55, 0)
 
-    # ── Adaptive ROI trapezoid outline (dashed yellow) ────────────────────────
-    roi_arr, tl, tr = _roi_points((h, w), steering_angle)
-    roi_pts   = roi_arr[0]
+    # ── ROI trapezoid outline ─────────────────────────────────────────────────
+    roi_pts = np.array([
+        (int(w * ROI_BOT_LEFT),  int(h * ROI_BOTTOM_Y)),
+        (int(w * ROI_TOP_LEFT),  int(h * ROI_TOP_Y)),
+        (int(w * ROI_TOP_RIGHT), int(h * ROI_TOP_Y)),
+        (int(w * ROI_BOT_RIGHT), int(h * ROI_BOTTOM_Y)),
+    ], dtype=np.int32)
     roi_color = (255, 220, 0)
     dash, gap = 14, 8
     for p1, p2 in zip(roi_pts, np.roll(roi_pts, -1, axis=0)):
@@ -677,8 +843,27 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
     for pt in roi_pts:
         cv2.circle(out, tuple(pt), 4, roi_color, -1, cv2.LINE_AA)
     cv2.putText(out, "ROI",
-                (int(w * (tl + tr) / 2) - 16, int(h * ROI_TOP_Y) - 8),
+                (int(w * (ROI_TOP_LEFT + ROI_TOP_RIGHT) / 2) - 16,
+                 int(h * ROI_TOP_Y) - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, roi_color, 1, cv2.LINE_AA)
+
+    # ── Stop line indicator ───────────────────────────────────────────────────
+    if stop_line_active:
+        stop_y = int(h * STOP_LINE_MIN_Y_FRAC)
+        cv2.line(out, (0, stop_y), (w, stop_y), (0, 0, 255), 3, cv2.LINE_AA)
+        cv2.putText(out, "STOP LINE", (w // 2 - 60, stop_y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
+
+    # ── Intersection signal indicator ─────────────────────────────────────────
+    if intersection_sigs is not None and intersection_sigs.score >= 1:
+        sig_text = (f"ISECT signals {intersection_sigs.score}/4 "
+                    f"[H:{int(intersection_sigs.horizontal_line)} "
+                    f"C:{int(intersection_sigs.conf_collapse)} "
+                    f"B:{int(intersection_sigs.line_burst)} "
+                    f"W:{int(intersection_sigs.width_anomaly)}]")
+        color = (0, 165, 255) if intersection_sigs.detected else (180, 180, 60)
+        cv2.putText(out, sig_text, (10, h - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
     # ── Steering decision line ────────────────────────────────────────────────
     sl_y = int(h * STEERING_LINE_Y_FRAC)
@@ -696,15 +881,21 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
                 return int(pts[i][0] + t * (pts[i + 1][0] - pts[i][0]))
         return None
 
-    lx_sl = _x_at_y(left_pts,  sl_y)
-    rx_sl = _x_at_y(right_pts, sl_y)
+    lx_sl = _x_at_y(left_pts,  sl_y) if state.left_real  else None
+    rx_sl = _x_at_y(right_pts, sl_y) if state.right_real else None
 
     if lx_sl is not None and rx_sl is not None:
         lane_cx = (lx_sl + rx_sl) // 2
+    elif lx_sl is not None and state.last_known_mid is not None:
+        lane_cx = lx_sl + (state.last_known_mid - lx_sl)
+    elif rx_sl is not None and state.last_known_mid is not None:
+        lane_cx = rx_sl - (rx_sl - state.last_known_mid)
     elif lx_sl is not None:
         lane_cx = lx_sl + int(ASSUMED_LANE_WIDTH_FRAC * w / 2)
     elif rx_sl is not None:
         lane_cx = rx_sl - int(ASSUMED_LANE_WIDTH_FRAC * w / 2)
+    elif state.last_known_mid is not None:
+        lane_cx = state.last_known_mid
     else:
         lane_cx = cx
 
@@ -716,7 +907,6 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
     else:
         arrow_col  = (0, 60, 230);  turn_label = "SHARP RIGHT" if steering_angle > 0 else "SHARP LEFT"
 
-    # Guide line, centre tick, arrow, dot, label
     cv2.line(out, (0, sl_y), (w, sl_y), (60, 60, 60), 1, cv2.LINE_AA)
     cv2.line(out, (cx, sl_y - 18), (cx, sl_y + 18), (200, 200, 200), 2, cv2.LINE_AA)
     cv2.arrowedLine(out, (cx, sl_y), (lane_cx, sl_y),
@@ -732,29 +922,31 @@ def draw_lanes(frame, left_pts, right_pts, state: LaneState,
     return out
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # COMPOSITE FRAME BUILDER
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 _STATE_COLOURS = {
-    DriveState.DRIVING:      (0,   200,   0),
-    DriveState.BRAKING:      (0,   165, 255),
-    DriveState.STOPPED_SIGN: (0,     0, 220),
-    DriveState.STOPPED_RED:  (0,     0, 220),
-    DriveState.RESUMING:     (255, 200,   0),
+    DriveState.DRIVING:          (0,   200,   0),
+    DriveState.APPROACHING_LINE: (0,   200, 255),
+    DriveState.BRAKING:          (0,   165, 255),
+    DriveState.STOPPED_SIGN:     (0,     0, 220),
+    DriveState.STOPPED_RED:      (0,     0, 220),
+    DriveState.RESUMING:         (255, 200,   0),
 }
 
 
 def build_display(base_frame, boxes_frame, left_pts, right_pts,
                   lane_state, steering_angle,
                   fps_window, prev_time, font,
-                  traffic_state=DriveState.DRIVING, traffic_text="DRIVING"):
+                  traffic_state=DriveState.DRIVING, traffic_text="DRIVING",
+                  stop_line_active=False,
+                  intersection_sigs=None):
 
-    # boxes_frame is None when YOLO is OFF → use raw frame
     display = boxes_frame.copy() if boxes_frame is not None else base_frame.copy()
-
-    # Lane overlay (trapezoid ROI + steering line baked in)
-    display = draw_lanes(display, left_pts, right_pts, lane_state, steering_angle)
+    display = draw_lanes(display, left_pts, right_pts, lane_state, steering_angle,
+                         stop_line_active=stop_line_active,
+                         intersection_sigs=intersection_sigs)
 
     direction = "RIGHT" if steering_angle > 0 else "LEFT" if steering_angle < 0 else "STRAIGHT"
     cv2.putText(display, f"Steer: {steering_angle:.1f}deg ({direction})",
@@ -766,18 +958,15 @@ def build_display(base_frame, boxes_frame, left_pts, right_pts,
     cv2.putText(display, f"FPS: {avg_fps:.1f}",
                 (10, 80), font, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
 
-    # Confidence readout
     cv2.putText(display,
                 f"L:{lane_state.left_conf:.2f}  R:{lane_state.right_conf:.2f}",
                 (10, 115), font, 0.6, (180, 180, 180), 1, cv2.LINE_AA)
 
-    # Traffic state banner
     colour = _STATE_COLOURS.get(traffic_state, (200, 200, 200))
     cv2.rectangle(display, (0, 130), (620, 162), (30, 30, 30), -1)
     cv2.putText(display, f"Traffic: {traffic_text}",
                 (10, 154), font, 0.9, colour, 2, cv2.LINE_AA)
 
-    # YOLO OFF badge (top-right)
     if not YOLO_ENABLED:
         bw, bh = 130, 28
         bx = display.shape[1] - bw - 10
@@ -789,9 +978,9 @@ def build_display(base_frame, boxes_frame, left_pts, right_pts,
     return display, direction, current_time
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # KART HELPER
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def make_kart():
     if not KART_ENABLED:
@@ -803,21 +992,23 @@ def make_kart():
     return kart
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # CAMERA MODE
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_on_camera(source=1):
     global frame_count, YOLO_ENABLED
     frame_count = 0
 
     kart = make_kart()
-    if kart: kart.release()
+    if kart:
+        kart.release()
 
-    capture  = FrameCapture(source=source, max_retries=5)
-    lane_det = LaneDetector()
-    yolo_det = YoloDetector()
-    traffic  = TrafficStateController()
+    capture      = FrameCapture(source=source, max_retries=5)
+    lane_det     = LaneDetector()
+    yolo_det     = YoloDetector()
+    traffic      = TrafficStateController()
+    isect_filter = IntersectionDetector(confirm_frames=4, cooldown_frames=60)
 
     fps_window = deque(maxlen=30)
     prev_time  = time.time()
@@ -833,24 +1024,35 @@ def run_on_camera(source=1):
 
     cv2.namedWindow("SDC View [EXP]", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("SDC View [EXP]", 1280, 720)
-    cv2.namedWindow("Lane Mask", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Lane Mask", 640, 360)
     print("Camera mode — press 'q' quit | 'e' e-stop | 'o' toggle YOLO")
 
     while True:
         frame = capture.read()
         if frame is None:
-            master.update(); continue
+            master.update()
+            continue
         if capture.stopped:
-            print("Camera stopped."); break
+            print("Camera stopped.")
+            break
 
         lane_det.submit(frame)
         yolo_det.submit(frame)
 
-        left_pts, right_pts, steering_angle, lane_state = lane_det.read()
-        boxes_frame, detections                          = yolo_det.read()
+        (left_pts, right_pts, steering_angle,
+         lane_state, stop_line, isect_sigs) = lane_det.read()
+        boxes_frame, detections = yolo_det.read()
 
-        brake_active, state_label, status_text = traffic.update(detections, kart)
+        # Intersection persistence filter
+        intersection_confirmed = isect_filter.update(isect_sigs)
+        if intersection_confirmed:
+            print(f"[INTERSECTION] Confirmed — signals: {isect_sigs.score}/4")
+
+        # Gate stop line: only pass it through while actually approaching
+        approaching      = (traffic.state == DriveState.APPROACHING_LINE)
+        gated_stop_line  = stop_line and approaching
+
+        brake_active, state_label, status_text = traffic.update(
+            detections, kart, stop_line_detected=gated_stop_line)
 
         if kart and not brake_active:
             kart.steer(angle_to_fraction(steering_angle))
@@ -859,7 +1061,9 @@ def run_on_camera(source=1):
             frame, boxes_frame, left_pts, right_pts,
             lane_state, steering_angle,
             fps_window, prev_time, font,
-            traffic.state, status_text)
+            traffic.state, status_text,
+            stop_line_active  = stop_line,
+            intersection_sigs = isect_sigs)
 
         draw_steering_wheel(wheel_canvas, steering_angle)
         master.update()
@@ -868,51 +1072,56 @@ def run_on_camera(source=1):
         if frame_count % PRINT_EVERY == 0:
             print(f"\n--- Frame {frame_count} | {direction:6s} {abs(steering_angle):.1f}° | "
                   f"L={'yes' if left_pts else 'no ':3s} R={'yes' if right_pts else 'no'} | "
+                  f"StopLine={stop_line} | Isect={isect_sigs.score}/4 | "
                   f"YOLO={'ON ' if YOLO_ENABLED else 'OFF'} | Traffic: {status_text} ---")
 
         cv2.imshow("SDC View [EXP]", display)
-        _roi = _roi_mask(frame.shape[:2], steering_angle=steering_angle)
-        cv2.imshow("Lane Mask", _lane_mask(cv2.bitwise_and(frame, frame, mask=_roi)))
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
         elif key == ord('e'):
-            if kart: kart.estop(); print("ESTOP!")
+            if kart:
+                kart.estop()
+            print("ESTOP!")
         elif key == ord('o'):
             YOLO_ENABLED = not YOLO_ENABLED
             print(f"[YOLO] {'ON' if YOLO_ENABLED else 'OFF'}")
 
     lane_det.release()
     yolo_det.release()
-    if kart: kart.close()
+    if kart:
+        kart.close()
     capture.release()
     cv2.destroyAllWindows()
     master.destroy()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # VIDEO MODE
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_on_video(path):
     global frame_count, YOLO_ENABLED
     frame_count = 0
 
     kart = make_kart()
-    if kart: kart.release()
+    if kart:
+        kart.release()
 
     cap = cv2.VideoCapture(path)
     if not cap.isOpened():
-        print(f"ERROR: Could not open video: {path}"); return
+        print(f"ERROR: Could not open video: {path}")
+        return
 
     video_fps = cap.get(cv2.CAP_PROP_FPS) or 30
     delay     = max(1, int(1000 / video_fps))
     total     = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     print(f"Video: {path}  |  {video_fps:.1f} fps  |  {total} frames")
 
-    lane_det = LaneDetector()
-    yolo_det = YoloDetector()
-    traffic  = TrafficStateController()
+    lane_det     = LaneDetector()
+    yolo_det     = YoloDetector()
+    traffic      = TrafficStateController()
+    isect_filter = IntersectionDetector(confirm_frames=4, cooldown_frames=60)
 
     fps_window = deque(maxlen=30)
     prev_time  = time.time()
@@ -928,8 +1137,6 @@ def run_on_video(path):
 
     cv2.namedWindow("SDC View [EXP]", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("SDC View [EXP]", 1280, 720)
-    cv2.namedWindow("Lane Mask", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Lane Mask", 640, 360)
     print("Video mode — press 'q' quit | 'p' pause | 'e' e-stop | 'o' toggle YOLO")
 
     paused = False
@@ -938,15 +1145,25 @@ def run_on_video(path):
         if not paused:
             ret, frame = cap.read()
             if not ret:
-                print("End of video."); break
+                print("End of video.")
+                break
 
             lane_det.submit(frame)
             yolo_det.submit(frame)
 
-            left_pts, right_pts, steering_angle, lane_state = lane_det.read()
-            boxes_frame, detections                          = yolo_det.read()
+            (left_pts, right_pts, steering_angle,
+             lane_state, stop_line, isect_sigs) = lane_det.read()
+            boxes_frame, detections = yolo_det.read()
 
-            brake_active, state_label, status_text = traffic.update(detections, kart)
+            intersection_confirmed = isect_filter.update(isect_sigs)
+            if intersection_confirmed:
+                print(f"[INTERSECTION] Confirmed — signals: {isect_sigs.score}/4")
+
+            approaching     = (traffic.state == DriveState.APPROACHING_LINE)
+            gated_stop_line = stop_line and approaching
+
+            brake_active, state_label, status_text = traffic.update(
+                detections, kart, stop_line_detected=gated_stop_line)
 
             if kart and not brake_active:
                 kart.steer(angle_to_fraction(steering_angle))
@@ -955,9 +1172,10 @@ def run_on_video(path):
                 frame, boxes_frame, left_pts, right_pts,
                 lane_state, steering_angle,
                 fps_window, prev_time, font,
-                traffic.state, status_text)
+                traffic.state, status_text,
+                stop_line_active  = stop_line,
+                intersection_sigs = isect_sigs)
 
-            # Progress bar
             bar_w = int(display.shape[1] * frame_count / max(total, 1))
             cv2.rectangle(display,
                           (0, display.shape[0] - 6),
@@ -972,11 +1190,10 @@ def run_on_video(path):
                 print(f"\n--- Frame {frame_count}/{total} | {direction:6s} "
                       f"{abs(steering_angle):.1f}° | "
                       f"L={'yes' if left_pts else 'no ':3s} R={'yes' if right_pts else 'no'} | "
+                      f"StopLine={stop_line} | Isect={isect_sigs.score}/4 | "
                       f"YOLO={'ON ' if YOLO_ENABLED else 'OFF'} | Traffic: {status_text} ---")
 
             cv2.imshow("SDC View [EXP]", display)
-            _roi = _roi_mask(frame.shape[:2], steering_angle=steering_angle)
-        cv2.imshow("Lane Mask", _lane_mask(cv2.bitwise_and(frame, frame, mask=_roi)))
 
         key = cv2.waitKey(delay) & 0xFF
         if key == ord('q'):
@@ -985,7 +1202,9 @@ def run_on_video(path):
             paused = not paused
             print("Paused." if paused else "Resumed.")
         elif key == ord('e'):
-            if kart: kart.estop(); print("ESTOP!")
+            if kart:
+                kart.estop()
+            print("ESTOP!")
         elif key == ord('o'):
             YOLO_ENABLED = not YOLO_ENABLED
             print(f"[YOLO] {'ON' if YOLO_ENABLED else 'OFF'}")
@@ -995,15 +1214,16 @@ def run_on_video(path):
 
     lane_det.release()
     yolo_det.release()
-    if kart: kart.close()
+    if kart:
+        kart.close()
     cap.release()
     cv2.destroyAllWindows()
     master.destroy()
 
 
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
-# ──────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
